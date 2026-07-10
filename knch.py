@@ -10,6 +10,7 @@ DURATION        = random.randint(18000, 28800)
 AUDIO_BITRATE_K = 128
 MIN_SIZE_BYTES  = int(1.0 * 1024 * 1024 * 1024)
 MAX_SIZE_BYTES  = int(1.95 * 1024 * 1024 * 1024)
+FADE_SEC        = 0.4   # fade in/out duration for each sub appearance
 
 TARGET_IMAGE_NAME = os.environ.get("TARGET_IMAGE_NAME")
 if not TARGET_IMAGE_NAME:
@@ -92,10 +93,38 @@ subs = (
 if not subs:
     raise SystemExit("No sub overlay video found.")
 sub_path = subs[0]
-output_path = TMP / f"OUT_{image_path.stem}.mp4"
 
+# ---------------------------------------------------------------------------
+# Build boomerang sub clip: original clip, then a full reverse of the SAME
+# clip appended after it, forming one combined unit. That combined unit is
+# what gets looped (-stream_loop -1) later. Video only — audio pipeline
+# (songs) is completely untouched.
+# ---------------------------------------------------------------------------
+print("Building boomerang (forward + reverse) sub clip...")
+sub_reversed_path  = TMP / "sub_reversed.mp4"
+sub_boomerang_path = TMP / "sub_boomerang.mp4"
+concat_sub_list     = TMP / "concat_sub.txt"
+
+subprocess.run(
+    ["ffmpeg", "-y", "-i", str(sub_path), "-vf", "reverse", "-an", str(sub_reversed_path)],
+    check=True
+)
+
+with open(concat_sub_list, "w") as f:
+    f.write(f"file '{sub_path}'\n")
+    f.write(f"file '{sub_reversed_path}'\n")
+
+subprocess.run(
+    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_sub_list),
+     "-c", "copy", str(sub_boomerang_path)],
+    check=True
+)
+
+sub_path = sub_boomerang_path  # everything downstream uses the boomerang unit
+
+output_path = TMP / f"OUT_{image_path.stem}.mp4"
 print(f"\n>>> IMAGE    : {image_path.name}")
-print(f">>> SUB      : {sub_path.name}")
+print(f">>> SUB      : {sub_path.name} (boomerang)")
 print(f">>> DURATION : {DURATION}s ({DURATION//60}m {DURATION%60}s)\n")
 
 stat = os.statvfs(str(TMP))
@@ -135,21 +164,34 @@ while t < DURATION - 10:
         intervals_right.append((t, end_t))
     t += random.randint(360, 840)
 
-def make_enable(intervals):
-    if not intervals: return "0"
-    return "+".join([f"between(t,{s},{e})" for s, e in intervals])
+def build_fade_chain(intervals, fade_dur=FADE_SEC):
+    """
+    Chain of fade filters (alpha only) that keeps the stream fully
+    transparent by default, then fades it in/out during each interval.
+    Requires an alpha channel already present on the input (yuva420p).
+    """
+    parts = ["fade=t=out:st=0:d=0.01:alpha=1"]  # baseline: invisible from t=0
+    for (s, e) in sorted(intervals):
+        dur = e - s
+        fd = min(fade_dur, dur / 2)
+        parts.append(f"fade=t=in:st={s}:d={fd}:alpha=1")
+        parts.append(f"fade=t=out:st={e - fd}:d={fd}:alpha=1")
+    return ",".join(parts)
 
-enable_left  = make_enable(intervals_left)
-enable_right = make_enable(intervals_right)
+fade_chain_left  = build_fade_chain(intervals_left)
+fade_chain_right = build_fade_chain(intervals_right)
+
 print(f"Sub overlay: {len(intervals_left)} left, {len(intervals_right)} right appearances")
 
 filter_complex = (
     f"[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
     f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p[bg];"
-    f"[1:v]scale=220:-1,chromakey=0x00ff00:0.3:0.1[sub_clean];"
-    f"[sub_clean]split[sl][sr];"
-    f"[bg][sl]overlay=30:H-h-30:enable='{enable_left}'[mid];"
-    f"[mid][sr]overlay=W-w-30:H-h-30:enable='{enable_right}'[outv]"
+    f"[1:v]scale=220:-1,chromakey=0x00ff00:0.3:0.1,format=yuva420p[sub_a];"
+    f"[sub_a]split[sl0][sr0];"
+    f"[sl0]{fade_chain_left}[sl];"
+    f"[sr0]{fade_chain_right}[sr];"
+    f"[bg][sl]overlay=30:H-h-30[mid];"
+    f"[mid][sr]overlay=W-w-30:H-h-30[outv]"
 )
 
 cmd = [
@@ -205,7 +247,6 @@ if not output_path.exists() or output_path.stat().st_size == 0:
 final_size    = output_path.stat().st_size
 final_size_mb = final_size / (1024 * 1024)
 final_size_gb = final_size / (1024 * 1024 * 1024)
-
 if final_size < MIN_SIZE_BYTES:
     print(f"[SIZE] ⚠️ Under 1 GB ({final_size_gb:.3f} GB).")
     under_minimum = True
