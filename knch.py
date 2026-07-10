@@ -223,15 +223,18 @@ filter_complex = (
     f"[mid][sr]overlay=x='{x_right}':y='{y_right}'[outv]"
 )
 
+# Background media input. -an mutes the original video's own audio track
+# (no-op for still images, which have no audio anyway).
 if is_video:
-    bg_input_args = ["-stream_loop", "-1", "-i", str(media_path)]
+    bg_input_args = ["-an", "-stream_loop", "-1", "-i", str(media_path)]
 else:
     bg_input_args = ["-loop", "1", "-framerate", "1", "-i", str(media_path)]
 
 cmd = [
     "ffmpeg", "-y",
     *bg_input_args,
-    "-stream_loop", "-1", "-i", str(sub_path),
+    # -an here mutes the sub/boomerang (duplicated) overlay clip's own audio.
+    "-an", "-stream_loop", "-1", "-i", str(sub_path),
     "-f", "concat", "-safe", "0", "-i", str(concat_path),
     "-t", str(DURATION),
     "-filter_complex", filter_complex,
