@@ -6,6 +6,7 @@ TMP             = Path("/tmp/redsky")
 IMAGES_FOLDER   = "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"
 SONGS_FOLDER    = "1DILwSnl-m4yY2w5J29hIlv19DnzNzVm_"
 SUB_FOLDER      = "1mpk5rcZRtVcjrKwrsrSIyfu6TzDWZiTl"
+
 DURATION        = random.randint(3600, 7200)   # 1-2 hours max
 MIN_SIZE_BYTES  = int(1.0 * 1024 * 1024 * 1024)
 MAX_SIZE_BYTES  = int(1.95 * 1024 * 1024 * 1024)
@@ -19,10 +20,14 @@ TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME") or os.environ.get("TARGE
 if not TARGET_MEDIA_NAME:
     raise SystemExit("TARGET_MEDIA_NAME env var not set.")
 
+JOB_INDEX = os.environ.get("JOB_INDEX")
+PROSPORTAL_LABEL = f"ProsPortal {int(JOB_INDEX) + 1}" if JOB_INDEX is not None else None
+
 TMP.mkdir(exist_ok=True)
 (TMP / "images").mkdir(exist_ok=True)
 (TMP / "songs").mkdir(exist_ok=True)
 (TMP / "sub").mkdir(exist_ok=True)
+
 
 def download_with_timeout(fn, timeout_sec=1800, label="download"):
     result = [None]; error = [None]
@@ -34,6 +39,7 @@ def download_with_timeout(fn, timeout_sec=1800, label="download"):
     if t.is_alive(): raise TimeoutError(f"{label} timed out after {timeout_sec}s")
     if error[0]: raise error[0]
     return result[0]
+
 
 stat = os.statvfs(str(TMP))
 free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
@@ -87,6 +93,7 @@ matches = list((TMP / "images").rglob(TARGET_MEDIA_NAME))
 if not matches:
     raise SystemExit(f"Target media {TARGET_MEDIA_NAME} not found.")
 media_path = matches[0]
+
 is_video = media_path.suffix.lower() in VIDEO_EXT
 is_image = media_path.suffix.lower() in IMAGE_EXT
 if not (is_video or is_image):
@@ -120,8 +127,14 @@ subprocess.run(
 )
 sub_path = sub_boomerang_path
 
-output_path = TMP / f"OUT_{media_path.stem}.mp4"
-print(f"\n>>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
+if PROSPORTAL_LABEL:
+    safe_label = PROSPORTAL_LABEL.replace(" ", "_")
+    output_path = TMP / f"{safe_label}_{media_path.stem}.mp4"
+else:
+    output_path = TMP / f"OUT_{media_path.stem}.mp4"
+
+print(f"\n>>> LABEL    : {PROSPORTAL_LABEL or '(none)'}")
+print(f">>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
 print(f">>> SUB      : {sub_path.name} (boomerang)")
 print(f">>> DURATION : {DURATION}s ({DURATION//60}m {DURATION%60}s)\n")
 
@@ -135,6 +148,7 @@ songs = list((TMP / "songs").glob("*.mp3"))
 if not songs:
     raise SystemExit("No songs found.")
 random.shuffle(songs)
+
 print("Song order:")
 for i, s in enumerate(songs):
     print(f"  {i+1}. {s.name}")
@@ -178,6 +192,7 @@ while t < DURATION - 10:
         intervals_right.append(entry)
     t += random.randint(360, 840)
 
+
 def build_fade_chain(intervals, fade_dur=FADE_SEC):
     parts = ["fade=t=out:st=0:d=0.01:alpha=1"]
     for (s, e, _, _) in sorted(intervals, key=lambda x: x[0]):
@@ -186,6 +201,7 @@ def build_fade_chain(intervals, fade_dur=FADE_SEC):
         parts.append(f"fade=t=in:st={s}:d={fd}:alpha=1")
         parts.append(f"fade=t=out:st={e - fd}:d={fd}:alpha=1")
     return ",".join(parts)
+
 
 def build_overlay_pos_expr(intervals, side):
     """
@@ -204,6 +220,7 @@ def build_overlay_pos_expr(intervals, side):
             x_expr = f"if({cond},W-w-{mx},{x_expr})"
         y_expr = f"if({cond},H-h-{my},{y_expr})"
     return (x_expr, y_expr)
+
 
 fade_chain_left  = build_fade_chain(intervals_left)
 fade_chain_right = build_fade_chain(intervals_right)
@@ -252,6 +269,7 @@ cmd = [
 
 print("\nRunning FFmpeg...")
 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
 stopped_by_watcher = False
 under_minimum = False
 
@@ -272,24 +290,29 @@ def size_watcher():
 
 watcher = threading.Thread(target=size_watcher, daemon=True)
 watcher.start()
+
 for line in proc.stdout:
     print(line, end="", flush=True)
+
 proc.wait()
 watcher.join()
 
 if not stopped_by_watcher and proc.returncode != 0:
     raise SystemExit(f"FFmpeg failed: {proc.returncode}")
+
 if not output_path.exists() or output_path.stat().st_size == 0:
     raise SystemExit("No output produced.")
 
 final_size    = output_path.stat().st_size
 final_size_mb = final_size / (1024 * 1024)
 final_size_gb = final_size / (1024 * 1024 * 1024)
+
 if final_size < MIN_SIZE_BYTES:
     print(f"[SIZE] ⚠️ Under 1 GB ({final_size_gb:.3f} GB).")
     under_minimum = True
 
 stop_reason = "cap reached" if stopped_by_watcher else "duration reached"
+
 print(f"\nDONE — {output_path}")
 print(f"Stop   : {stop_reason}")
 print(f"Size   : {final_size_mb:.1f} MB ({final_size_gb:.3f} GB)")
@@ -303,3 +326,5 @@ if github_output:
         f.write(f"duration_seconds={DURATION}\n")
         f.write(f"final_size_mb={final_size_mb:.1f}\n")
         f.write(f"under_minimum={str(under_minimum).lower()}\n")
+        if PROSPORTAL_LABEL:
+            f.write(f"prosportal_label={PROSPORTAL_LABEL}\n")
