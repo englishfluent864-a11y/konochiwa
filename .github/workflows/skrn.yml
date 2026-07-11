@@ -70,6 +70,7 @@ jobs:
         id: render
         env:
           TARGET_MEDIA_NAME: ${{ matrix.media_name }}
+          JOB_INDEX: ${{ strategy.job-index }}
         run: python knch.py
       - name: Tag
         id: tag
