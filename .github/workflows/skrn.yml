@@ -74,14 +74,18 @@ jobs:
       - name: Tag
         id: tag
         run: |
+          IDX=$(( ${{ strategy.job-index }} + 1 ))
           TS=$(date -u +"%Y%m%d_%H%M%S")
-          STEM=$(echo "${{ matrix.media_name }}" | sed 's/\.[^.]*$//')
-          echo "tag=r_${STEM}_${TS}" >> $GITHUB_OUTPUT
+          echo "tag=prosportal_${IDX}_${TS}" >> $GITHUB_OUTPUT
+          echo "title=ProsPortal ${IDX}" >> $GITHUB_OUTPUT
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: "${{ steps.render.outputs.final_size_mb }} MB"
+          name: "${{ steps.tag.outputs.title }}"
+          body: |
+            Source: ${{ matrix.media_name }}
+            Size: ${{ steps.render.outputs.final_size_mb }} MB
           files: ${{ steps.render.outputs.output_path }}
           fail_on_unmatched_files: true
         env:
