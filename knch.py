@@ -1,157 +1,151 @@
-import os, random, subprocess, threading, time
+"""
+Ambient/lofi channel render script — built for long-term channel health.
+
+Design choices vs. a "mass-produced" pipeline:
+  - Real 24fps motion (slow pan/zoom on stills, natural playback on video clips)
+    instead of a frozen 1fps frame — this is the single biggest "is this a real
+    video" signal on manual review.
+  - One fixed-position brand overlay (logo/watermark), same spot every time.
+    No randomized timing/position — that pattern reads as duplicate-detection
+    evasion, which is worse for you than just not having an overlay at all.
+  - Visible on-screen "AI-generated content" label baked into the video, as the
+    visual half of disclosure (pair this with YouTube Studio's "Altered or
+    synthetic content" toggle at upload time — that's the metadata half, and
+    scripts can't set it for you).
+  - Every render appends a row to asset_manifest.csv: which song/image was
+    used, when, and where it came from — so a Content ID dispute is a
+    5-minute copy-paste instead of a guessing game.
+
+You still control curation: this script does NOT auto-fan across every file
+in a folder. Point TARGET_MEDIA_NAME at one deliberately chosen source per
+run, so each upload is a decision, not a batch output.
+"""
+
+import os
+import csv
+import random
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+
 import gdown
 
-TMP             = Path("/tmp/redsky")
-IMAGES_FOLDER   = "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"
-SONGS_FOLDER    = "1DILwSnl-m4yY2w5J29hIlv19DnzNzVm_"
-SUB_FOLDER      = "1mpk5rcZRtVcjrKwrsrSIyfu6TzDWZiTl"
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+TMP = Path("/tmp/render")
+IMAGES_FOLDER = os.environ.get("IMAGES_FOLDER_ID", "")
+SONGS_FOLDER = os.environ.get("SONGS_FOLDER_ID", "")
 
-DURATION        = random.randint(3600, 7200)   # 1-2 hours max
-MIN_SIZE_BYTES  = int(1.0 * 1024 * 1024 * 1024)
-MAX_SIZE_BYTES  = int(1.95 * 1024 * 1024 * 1024)
-TARGET_SIZE_BYTES = int(1.5 * 1024 * 1024 * 1024)  # aim for the middle of the band
-FADE_SEC        = 0.4
+LOGO_PATH = os.environ.get("LOGO_PATH", "")  # local path to your fixed brand logo (png, transparent bg)
+CHANNEL_TAG = os.environ.get("CHANNEL_TAG", "")  # short id if you run more than one distinct channel
 
-IMAGE_EXT = ('.png', '.jpg', '.jpeg')
-VIDEO_EXT = ('.mp4', '.mov', '.mkv', '.webm', '.avi')
+DURATION = int(os.environ.get("DURATION_SECONDS", str(random.randint(3600, 7200))))
+FPS = 24
+AUDIO_BITRATE_K = 160
+TARGET_SIZE_BYTES = int(float(os.environ.get("TARGET_SIZE_GB", "1.5")) * 1024 * 1024 * 1024)
+MIN_SIZE_BYTES = int(1.0 * 1024 * 1024 * 1024)
+MAX_SIZE_BYTES = int(1.95 * 1024 * 1024 * 1024)
 
-TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME") or os.environ.get("TARGET_IMAGE_NAME")
+IMAGE_EXT = (".png", ".jpg", ".jpeg")
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi")
+
+TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME")
 if not TARGET_MEDIA_NAME:
-    raise SystemExit("TARGET_MEDIA_NAME env var not set.")
+    raise SystemExit("TARGET_MEDIA_NAME env var not set — pick one source deliberately per run.")
 
-JOB_INDEX = os.environ.get("JOB_INDEX")
-PROSPORTAL_LABEL = f"ProsPortal {int(JOB_INDEX) + 1}" if JOB_INDEX is not None else None
-
-TMP.mkdir(exist_ok=True)
+TMP.mkdir(parents=True, exist_ok=True)
 (TMP / "images").mkdir(exist_ok=True)
 (TMP / "songs").mkdir(exist_ok=True)
-(TMP / "sub").mkdir(exist_ok=True)
+
+MANIFEST_PATH = Path(os.environ.get("MANIFEST_PATH", "asset_manifest.csv"))
+
+
+def log_manifest(filename: str, kind: str, source_folder_id: str, note: str = ""):
+    """Append one row per asset used in this render. Keep this file forever —
+    it's your Content ID dispute evidence and your licensing paper trail."""
+    is_new = not MANIFEST_PATH.exists()
+    with open(MANIFEST_PATH, "a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(["timestamp_utc", "filename", "kind", "source_folder_id", "note"])
+        w.writerow([datetime.now(timezone.utc).isoformat(), filename, kind, source_folder_id, note])
 
 
 def download_with_timeout(fn, timeout_sec=1800, label="download"):
-    result = [None]; error = [None]
+    result, error = [None], [None]
+
     def worker():
-        try: result[0] = fn()
-        except Exception as e: error[0] = e
+        try:
+            result[0] = fn()
+        except Exception as e:
+            error[0] = e
+
     t = threading.Thread(target=worker, daemon=True)
-    t.start(); t.join(timeout_sec)
-    if t.is_alive(): raise TimeoutError(f"{label} timed out after {timeout_sec}s")
-    if error[0]: raise error[0]
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        raise TimeoutError(f"{label} timed out after {timeout_sec}s")
+    if error[0]:
+        raise error[0]
     return result[0]
 
 
+def retrying_download(folder_id, out_dir, label, attempts=3):
+    for attempt in range(attempts):
+        try:
+            download_with_timeout(
+                lambda: gdown.download_folder(id=folder_id, output=str(out_dir), quiet=False),
+                timeout_sec=900,
+                label=label,
+            )
+            return
+        except Exception as e:
+            print(f"[{label}] attempt {attempt + 1} failed: {e}")
+            if attempt == attempts - 1:
+                raise SystemExit(f"{label} download failed: {e}")
+            time.sleep(30)
+
+
+# ---------------------------------------------------------------------------
+# Disk check
+# ---------------------------------------------------------------------------
 stat = os.statvfs(str(TMP))
 free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
 print(f"[DISK] Free space: {free_gb:.1f} GB")
 if free_gb < 4.0:
     raise SystemExit(f"[DISK] Not enough free space ({free_gb:.1f} GB).")
 
-print("Downloading media (images/videos)...")
-for attempt in range(3):
-    try:
-        download_with_timeout(
-            lambda: gdown.download_folder(id=IMAGES_FOLDER, output=str(TMP / "images"), quiet=False),
-            timeout_sec=900, label="media"
-        )
-        break
-    except Exception as e:
-        print(f"Attempt {attempt+1} failed: {e}")
-        if attempt == 2:
-            raise SystemExit(f"media download failed: {e}")
-        time.sleep(30)
-
+print("Downloading media...")
+retrying_download(IMAGES_FOLDER, TMP / "images", "media")
 print("Downloading songs...")
-for attempt in range(3):
-    try:
-        download_with_timeout(
-            lambda: gdown.download_folder(id=SONGS_FOLDER, output=str(TMP / "songs"), quiet=False),
-            timeout_sec=900, label="songs"
-        )
-        break
-    except Exception as e:
-        print(f"Attempt {attempt+1} failed: {e}")
-        if attempt == 2:
-            raise SystemExit(f"songs download failed: {e}")
-        time.sleep(30)
-
-print("Downloading sub overlay...")
-for attempt in range(3):
-    try:
-        download_with_timeout(
-            lambda: gdown.download_folder(id=SUB_FOLDER, output=str(TMP / "sub"), quiet=False),
-            timeout_sec=600, label="sub"
-        )
-        break
-    except Exception as e:
-        print(f"Attempt {attempt+1} failed: {e}")
-        if attempt == 2:
-            raise SystemExit(f"sub download failed: {e}")
-        time.sleep(30)
+retrying_download(SONGS_FOLDER, TMP / "songs", "songs")
 
 matches = list((TMP / "images").rglob(TARGET_MEDIA_NAME))
 if not matches:
     raise SystemExit(f"Target media {TARGET_MEDIA_NAME} not found.")
 media_path = matches[0]
+log_manifest(media_path.name, "background_media", IMAGES_FOLDER,
+             "confirm original license/rights for this asset before publishing")
 
 is_video = media_path.suffix.lower() in VIDEO_EXT
 is_image = media_path.suffix.lower() in IMAGE_EXT
 if not (is_video or is_image):
     raise SystemExit(f"Unsupported media type: {media_path.suffix}")
 
-subs = (
-    list((TMP / "sub").glob("*.mp4")) +
-    list((TMP / "sub").glob("*.mov")) +
-    list((TMP / "sub").glob("*.webm"))
-)
-if not subs:
-    raise SystemExit("No sub overlay video found.")
-sub_path = subs[0]
-
-print("Building boomerang (forward + reverse) sub clip...")
-sub_reversed_path  = TMP / "sub_reversed.mp4"
-sub_boomerang_path = TMP / "sub_boomerang.mp4"
-concat_sub_list     = TMP / "concat_sub.txt"
-
-subprocess.run(
-    ["ffmpeg", "-y", "-i", str(sub_path), "-vf", "reverse", "-an", str(sub_reversed_path)],
-    check=True
-)
-with open(concat_sub_list, "w") as f:
-    f.write(f"file '{sub_path}'\n")
-    f.write(f"file '{sub_reversed_path}'\n")
-subprocess.run(
-    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_sub_list),
-     "-c", "copy", str(sub_boomerang_path)],
-    check=True
-)
-sub_path = sub_boomerang_path
-
-if PROSPORTAL_LABEL:
-    safe_label = PROSPORTAL_LABEL.replace(" ", "_")
-    output_path = TMP / f"{safe_label}_{media_path.stem}.mp4"
-else:
-    output_path = TMP / f"OUT_{media_path.stem}.mp4"
-
-print(f"\n>>> LABEL    : {PROSPORTAL_LABEL or '(none)'}")
-print(f">>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
-print(f">>> SUB      : {sub_path.name} (boomerang)")
-print(f">>> DURATION : {DURATION}s ({DURATION//60}m {DURATION%60}s)\n")
-
-stat = os.statvfs(str(TMP))
-free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
-print(f"[DISK] Free after downloads: {free_gb:.1f} GB")
-if free_gb < 2.0:
-    raise SystemExit(f"[DISK] Not enough space ({free_gb:.1f} GB).")
-
 songs = list((TMP / "songs").glob("*.mp3"))
 if not songs:
     raise SystemExit("No songs found.")
 random.shuffle(songs)
+for s in songs:
+    log_manifest(s.name, "music", SONGS_FOLDER,
+                 "confirm license (e.g. Pixabay page URL) and record it here manually")
 
 print("Song order:")
 for i, s in enumerate(songs):
-    print(f"  {i+1}. {s.name}")
+    print(f"  {i + 1}. {s.name}")
 
 concat_path = TMP / f"concat_{media_path.stem}.txt"
 estimated_song_len = 200
@@ -164,104 +158,82 @@ with open(concat_path, "w") as f:
             f.write(f"file '{s}'\n")
 
 # ---------------------------------------------------------------------------
-# Bitrate math: solve for a video bitrate that lands the whole file near
-# TARGET_SIZE_BYTES for this DURATION, given a fixed audio bitrate.
-# total_bits = (video_kbps + audio_kbps) * 1000 * DURATION
+# Bitrate math — sizing for quality/upload practicality, not for evasion.
 # ---------------------------------------------------------------------------
-AUDIO_BITRATE_K = 128
 target_bits = TARGET_SIZE_BYTES * 8
 target_total_kbps = target_bits / 1000 / DURATION
-video_bitrate_k = max(300, int(target_total_kbps - AUDIO_BITRATE_K))
-print(f"[BITRATE] video={video_bitrate_k}k audio={AUDIO_BITRATE_K}k target_total={target_total_kbps:.0f}k")
+video_bitrate_k = max(600, int(target_total_kbps - AUDIO_BITRATE_K))
+print(f"[BITRATE] video={video_bitrate_k}k audio={AUDIO_BITRATE_K}k")
 
-# Sub overlay: every 6-14 min randomized, 3-4 sec, alternating left/right,
-# with a randomized margin range each time (not a fixed pixel spot) so
-# placement isn't identical on every appearance.
-intervals_left  = []
-intervals_right = []
-t = random.randint(360, 840)
-while t < DURATION - 10:
-    show_dur = random.randint(3, 4)
-    end_t = t + show_dur
-    margin_x = random.randint(20, 60)
-    margin_y = random.randint(20, 60)
-    entry = (t, end_t, margin_x, margin_y)
-    if random.random() < 0.5:
-        intervals_left.append(entry)
-    else:
-        intervals_right.append(entry)
-    t += random.randint(360, 840)
+# ---------------------------------------------------------------------------
+# Output naming
+# ---------------------------------------------------------------------------
+label = CHANNEL_TAG or "render"
+ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+output_path = TMP / f"{label}_{media_path.stem}_{ts}.mp4"
 
+print(f"\n>>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
+print(f">>> DURATION : {DURATION}s ({DURATION // 60}m {DURATION % 60}s) @ {FPS}fps\n")
 
-def build_fade_chain(intervals, fade_dur=FADE_SEC):
-    parts = ["fade=t=out:st=0:d=0.01:alpha=1"]
-    for (s, e, _, _) in sorted(intervals, key=lambda x: x[0]):
-        dur = e - s
-        fd = min(fade_dur, dur / 2)
-        parts.append(f"fade=t=in:st={s}:d={fd}:alpha=1")
-        parts.append(f"fade=t=out:st={e - fd}:d={fd}:alpha=1")
-    return ",".join(parts)
+# ---------------------------------------------------------------------------
+# Filter graph
+#   - image source: slow zoompan (real motion, not a frozen frame)
+#   - video source: plays at natural speed, looped if shorter than DURATION
+#   - fixed-position logo overlay (top-left, subtle, consistent every video)
+#   - permanent small "AI-generated content" disclosure label (bottom-right)
+# ---------------------------------------------------------------------------
+if is_image:
+    bg_input_args = ["-loop", "1", "-i", str(media_path)]
+    zoom_frames = DURATION * FPS
+    bg_filter = (
+        f"[0:v]scale=3840:2160:force_original_aspect_ratio=increase,"
+        f"crop=3840:2160,"
+        f"zoompan=z='min(zoom+0.0006,1.15)':d={zoom_frames}:s=1920x1080:fps={FPS},"
+        f"format=yuv420p[bg]"
+    )
+else:
+    bg_input_args = ["-an", "-stream_loop", "-1", "-i", str(media_path)]
+    bg_filter = (
+        f"[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+        f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p[bg]"
+    )
 
+filter_parts = [bg_filter]
+video_label = "[bg]"
 
-def build_overlay_pos_expr(intervals, side):
-    """
-    Builds an x/y overlay expression that switches margin per interval using
-    nested if()/between() so each appearance uses its own randomized margin,
-    instead of one fixed offset for the whole video.
-    """
-    if not intervals:
-        return ("0", "0")
-    x_expr, y_expr = "0", "0"
-    for (s, e, mx, my) in sorted(intervals, key=lambda x: x[0]):
-        cond = f"between(t,{s},{e})"
-        if side == "left":
-            x_expr = f"if({cond},{mx},{x_expr})"
-        else:
-            x_expr = f"if({cond},W-w-{mx},{x_expr})"
-        y_expr = f"if({cond},H-h-{my},{y_expr})"
-    return (x_expr, y_expr)
+if LOGO_PATH and Path(LOGO_PATH).exists():
+    filter_parts.append("[1:v]scale=140:-1,format=rgba[logo]")
+    filter_parts.append(f"{video_label}[logo]overlay=x=30:y=30:format=auto[bglogo]")
+    video_label = "[bglogo]"
+    logo_input_args = ["-i", LOGO_PATH]
+else:
+    logo_input_args = []
 
-
-fade_chain_left  = build_fade_chain(intervals_left)
-fade_chain_right = build_fade_chain(intervals_right)
-x_left, y_left   = build_overlay_pos_expr(intervals_left, "left")
-x_right, y_right = build_overlay_pos_expr(intervals_right, "right")
-
-print(f"Sub overlay: {len(intervals_left)} left, {len(intervals_right)} right appearances")
-
-filter_complex = (
-    f"[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
-    f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p[bg];"
-    f"[1:v]scale=220:-1,chromakey=0x00ff00:0.3:0.1,format=yuva420p[sub_a];"
-    f"[sub_a]split[sl0][sr0];"
-    f"[sl0]{fade_chain_left}[sl];"
-    f"[sr0]{fade_chain_right}[sr];"
-    f"[bg][sl]overlay=x='{x_left}':y='{y_left}'[mid];"
-    f"[mid][sr]overlay=x='{x_right}':y='{y_right}'[outv]"
+# Visible AI-content disclosure label, present for the whole video.
+disclosure_text = "AI-generated content"
+filter_parts.append(
+    f"{video_label}drawtext=text='{disclosure_text}':fontcolor=white@0.75:fontsize=22:"
+    f"box=1:boxcolor=black@0.35:boxborderw=8:x=w-tw-24:y=h-th-24[outv]"
 )
 
-# Background media input. -an mutes the original video's own audio track
-# (no-op for still images, which have no audio anyway).
-if is_video:
-    bg_input_args = ["-an", "-stream_loop", "-1", "-i", str(media_path)]
-else:
-    bg_input_args = ["-loop", "1", "-framerate", "1", "-i", str(media_path)]
+filter_complex = ";".join(filter_parts)
+
+audio_input_index = 1 + (1 if logo_input_args else 0)
 
 cmd = [
     "ffmpeg", "-y",
     *bg_input_args,
-    # -an here mutes the sub/boomerang (duplicated) overlay clip's own audio.
-    "-an", "-stream_loop", "-1", "-i", str(sub_path),
+    *logo_input_args,
     "-f", "concat", "-safe", "0", "-i", str(concat_path),
     "-t", str(DURATION),
     "-filter_complex", filter_complex,
     "-map", "[outv]",
-    "-map", "2:a",
+    "-map", f"{audio_input_index}:a",
     "-c:v", "libx264", "-preset", "medium",
     "-b:v", f"{video_bitrate_k}k",
     "-maxrate", f"{int(video_bitrate_k * 1.2)}k",
     "-bufsize", f"{int(video_bitrate_k * 2)}k",
-    "-r", "1", "-g", "2",
+    "-r", str(FPS), "-g", str(FPS * 2),
     "-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_K}k", "-ar", "44100",
     "-movflags", "+faststart",
     str(output_path),
@@ -271,7 +243,7 @@ print("\nRunning FFmpeg...")
 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 stopped_by_watcher = False
-under_minimum = False
+
 
 def size_watcher():
     global stopped_by_watcher
@@ -279,14 +251,13 @@ def size_watcher():
         time.sleep(15)
         if output_path.exists():
             size = output_path.stat().st_size
-            mb = size / (1024 * 1024)
-            gb = size / (1024 * 1024 * 1024)
-            print(f"[SIZE] {mb:.1f} MB ({gb:.3f} GB)", flush=True)
+            print(f"[SIZE] {size / (1024 * 1024):.1f} MB", flush=True)
             if size >= MAX_SIZE_BYTES:
                 print("[SIZE] Cap reached — stopping.", flush=True)
                 stopped_by_watcher = True
                 proc.terminate()
                 break
+
 
 watcher = threading.Thread(target=size_watcher, daemon=True)
 watcher.start()
@@ -303,20 +274,14 @@ if not stopped_by_watcher and proc.returncode != 0:
 if not output_path.exists() or output_path.stat().st_size == 0:
     raise SystemExit("No output produced.")
 
-final_size    = output_path.stat().st_size
-final_size_mb = final_size / (1024 * 1024)
-final_size_gb = final_size / (1024 * 1024 * 1024)
-
-if final_size < MIN_SIZE_BYTES:
-    print(f"[SIZE] ⚠️ Under 1 GB ({final_size_gb:.3f} GB).")
-    under_minimum = True
-
-stop_reason = "cap reached" if stopped_by_watcher else "duration reached"
-
+final_size_mb = output_path.stat().st_size / (1024 * 1024)
 print(f"\nDONE — {output_path}")
-print(f"Stop   : {stop_reason}")
-print(f"Size   : {final_size_mb:.1f} MB ({final_size_gb:.3f} GB)")
-print(f"1-2 GB : {'✅' if MIN_SIZE_BYTES <= final_size <= MAX_SIZE_BYTES else '❌'}")
+print(f"Size   : {final_size_mb:.1f} MB")
+print(f"Manifest updated at: {MANIFEST_PATH.resolve()}")
+print("\nReminder before publishing:")
+print(" 1. In YouTube Studio upload flow, toggle 'Altered or synthetic content' if applicable.")
+print(" 2. Write a real, specific title/description/thumbnail for this upload — no template text.")
+print(" 3. Double check every song/image row in asset_manifest.csv has a real license source noted.")
 
 github_output = os.environ.get("GITHUB_OUTPUT")
 if github_output:
@@ -325,6 +290,3 @@ if github_output:
         f.write(f"media_name={media_path.name}\n")
         f.write(f"duration_seconds={DURATION}\n")
         f.write(f"final_size_mb={final_size_mb:.1f}\n")
-        f.write(f"under_minimum={str(under_minimum).lower()}\n")
-        if PROSPORTAL_LABEL:
-            f.write(f"prosportal_label={PROSPORTAL_LABEL}\n")
