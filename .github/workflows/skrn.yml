@@ -1,59 +1,37 @@
 name: Render
+
+# Deliberately manual — you pick the source file per run instead of
+# auto-fanning across an entire folder. That "one script -> N near-identical
+# outputs" pattern is exactly what YouTube's inauthentic-content policy
+# targets, so this workflow does not do it for you.
 on:
   workflow_dispatch:
+    inputs:
+      media_name:
+        description: "Exact filename of the background image/video to use for this run"
+        required: true
+        type: string
+      duration_seconds:
+        description: "Video length in seconds (leave blank for a random 1-2hr)"
+        required: false
+        type: string
+      channel_tag:
+        description: "Short tag if you run more than one distinct channel (e.g. midnight-drive)"
+        required: false
+        type: string
+        default: "render"
+
 permissions:
   contents: write
+
 jobs:
-  discover:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.discover.outputs.matrix }}
-      has_work: ${{ steps.discover.outputs.has_work }}
-    steps:
-      - name: Install gdown
-        run: pip install gdown --break-system-packages
-      - name: Discover
-        id: discover
-        run: |
-          python -c "
-          import json, os, sys, time
-          from pathlib import Path
-          import gdown
-          IMAGES_FOLDER = '1bbYxw2pNbVS05liS0pObjxevuJ-BdXck'
-          TMP_DIR = Path('/tmp/discover_redsky')
-          TMP_DIR.mkdir(parents=True, exist_ok=True)
-          for attempt in range(3):
-              try:
-                  gdown.download_folder(id=IMAGES_FOLDER, output=str(TMP_DIR), quiet=False)
-                  break
-              except Exception as e:
-                  print(f'Attempt {attempt+1} failed: {e}')
-                  if attempt == 2:
-                      sys.exit(1)
-                  time.sleep(30)
-          MEDIA_EXT = ('.png', '.jpg', '.jpeg', '.mp4', '.mov', '.mkv', '.webm', '.avi')
-          all_media = sorted(
-              p for p in TMP_DIR.rglob('*')
-              if p.suffix.lower() in MEDIA_EXT
-          )
-          if not all_media:
-              sys.exit(1)
-          matrix = {'include': [{'media_name': p.name} for p in all_media]}
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f'matrix={json.dumps(matrix)}\n')
-              f.write('has_work=true\n')
-          "
   render:
-    needs: discover
-    if: needs.discover.outputs.has_work == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 340
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -61,32 +39,51 @@ jobs:
           sudo apt-get clean
           docker system prune -af || true
           df -h
+
       - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg --fix-missing
           pip install gdown --break-system-packages
-      - name: Run
+
+      - name: Run render
         id: render
         env:
-          TARGET_MEDIA_NAME: ${{ matrix.media_name }}
-          JOB_INDEX: ${{ strategy.job-index }}
-        run: python knch.py
-      - name: Tag
+          TARGET_MEDIA_NAME: ${{ inputs.media_name }}
+          DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          CHANNEL_TAG: ${{ inputs.channel_tag }}
+          IMAGES_FOLDER_ID: ${{ secrets.IMAGES_FOLDER_ID }}
+          SONGS_FOLDER_ID: ${{ secrets.SONGS_FOLDER_ID }}
+          LOGO_PATH: ${{ github.workspace }}/assets/logo.png
+        run: python render.py
+
+      - name: Upload asset manifest as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-manifest
+          path: asset_manifest.csv
+          if-no-files-found: warn
+
+      - name: Tag release
         id: tag
         run: |
-          IDX=$(( ${{ strategy.job-index }} + 1 ))
           TS=$(date -u +"%Y%m%d_%H%M%S")
-          echo "tag=prosportal_${IDX}_${TS}" >> $GITHUB_OUTPUT
-          echo "title=ProsPortal ${IDX}" >> $GITHUB_OUTPUT
+          echo "tag=${{ inputs.channel_tag }}_${TS}" >> $GITHUB_OUTPUT
+          echo "title=${{ inputs.channel_tag }} ${TS}" >> $GITHUB_OUTPUT
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "${{ steps.tag.outputs.title }}"
           body: |
-            Source: ${{ matrix.media_name }}
+            Source: ${{ inputs.media_name }}
             Size: ${{ steps.render.outputs.final_size_mb }} MB
+
+            Before publishing to YouTube:
+            - Toggle "Altered or synthetic content" in Studio if applicable
+            - Write a unique title/description/thumbnail for this upload
+            - Check asset_manifest.csv for this video's licensing sources
           files: ${{ steps.render.outputs.output_path }}
           fail_on_unmatched_files: true
         env:
