@@ -3,25 +3,23 @@ Ambient/lofi channel render script.
 
 Pipeline:
   - Background image with a continuous oscillating zoom: 7s zoom-in,
-    7s zoom-out, forever (period = 14s), instead of a frozen frame or a
-    one-directional creep that flattens out.
+    7s zoom-out, forever (period = 14s).
   - Fixed-position brand logo overlay (optional), same spot every render.
   - Visible "AI-generated content" disclosure label baked into the video
     (bottom-left) as the visual half of disclosure. Pair this with
     YouTube Studio's "Altered or synthetic content" toggle at upload time
-    -- that's the metadata half, and this script can't set it for you.
+    -- that's the metadata half, this script can't set it for you.
   - A green-screen "Subscribe" clip keyed and overlaid bottom-right, on a
-    fixed position, appearing repeatedly at randomized 3-7 minute gaps for
-    the length of the render.
-  - asset_manifest.csv logs every asset used per render (filename, source,
-    timestamp) so a Content ID dispute or licensing check is a lookup, not
-    a guessing game. You still need to actually confirm/own the rights to
-    every image/song/overlay you point this at -- the manifest is a paper
-    trail, not a license.
+    fixed position, appearing repeatedly at randomized 3-7 minute gaps.
+  - A thumbnail frame pulled from the finished render, so releases are
+    identifiable at a glance instead of just a filename+timestamp.
+  - asset_manifest.csv logs every asset used per render. You still need to
+    actually confirm/own the rights to every image/song/overlay you point
+    this at -- the manifest is a paper trail, not a license.
 
-You still control curation: this script does NOT auto-fan across every file
-in a folder. Point TARGET_MEDIA_NAME at one deliberately chosen source per
-run, so each upload is a decision, not a batch output.
+If TARGET_MEDIA_NAME isn't set, one image/video is picked automatically
+from the downloaded images folder (uniform random) so this can run
+unattended end-to-end.
 """
 
 import os
@@ -41,29 +39,24 @@ import gdown
 TMP = Path("/tmp/render")
 IMAGES_FOLDER = os.environ.get("IMAGES_FOLDER_ID", "")
 SONGS_FOLDER = os.environ.get("SONGS_FOLDER_ID", "")
-SUB_FILE_ID = os.environ.get("SUB_FILE_ID", "")  # single green-screen subscribe clip
+SUB_FILE_ID = os.environ.get("SUB_FILE_ID", "")
 
-LOGO_PATH = os.environ.get("LOGO_PATH", "")  # local path to fixed brand logo (png, transparent bg)
+LOGO_PATH = os.environ.get("LOGO_PATH", "")
 CHANNEL_TAG = os.environ.get("CHANNEL_TAG", "")
 
-# Duration: random 1-3 hours unless explicitly set
 DURATION = int(os.environ.get("DURATION_SECONDS") or random.randint(3600, 10800))
 FPS = 24
 
-# Zoom: 7s in / 7s out, forever. Half a sine period = one direction, so a
-# 14s period gives exactly 7s trough->peak and 7s peak->trough.
 ZOOM_MIN = float(os.environ.get("ZOOM_MIN", "1.0"))
 ZOOM_MAX = float(os.environ.get("ZOOM_MAX", "1.15"))
 ZOOM_PERIOD_SECONDS = 14.0
 
-# Size targeting: stay between 1.0GB and 1.9GB, aim for the middle.
-AUDIO_BITRATE_K = 160
+AUDIO_BITRATE_K = 192
 TARGET_SIZE_GB = float(os.environ.get("TARGET_SIZE_GB", "1.5"))
 TARGET_SIZE_BYTES = int(TARGET_SIZE_GB * 1024 * 1024 * 1024)
 MIN_SIZE_BYTES = int(1.0 * 1024 * 1024 * 1024)
 MAX_SIZE_BYTES = int(1.9 * 1024 * 1024 * 1024)
 
-# Subscribe overlay cadence: gap of 3-7 minutes between showings, randomized.
 SUB_GAP_MIN_SEC = 180
 SUB_GAP_MAX_SEC = 420
 SUB_MAX_SHOW_SECONDS = float(os.environ.get("SUB_MAX_SHOW_SECONDS", "6"))
@@ -75,9 +68,7 @@ SUB_SCALE_WIDTH = os.environ.get("SUB_SCALE_WIDTH", "340")
 IMAGE_EXT = (".png", ".jpg", ".jpeg")
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi")
 
-TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME")
-if not TARGET_MEDIA_NAME:
-    raise SystemExit("TARGET_MEDIA_NAME env var not set -- pick one source deliberately per run.")
+TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME", "").strip()
 
 TMP.mkdir(parents=True, exist_ok=True)
 (TMP / "images").mkdir(exist_ok=True)
@@ -178,17 +169,33 @@ if SUB_FILE_ID:
     log_manifest(sub_path.name, "subscribe_overlay", SUB_FILE_ID,
                  "confirm you have rights to use/host this asset")
 
-matches = list((TMP / "images").rglob(TARGET_MEDIA_NAME))
-if not matches:
-    raise SystemExit(f"Target media {TARGET_MEDIA_NAME} not found.")
-media_path = matches[0]
+# ---------------------------------------------------------------------------
+# Pick source media -- explicit name if given, otherwise auto-pick so this
+# can run fully unattended.
+# ---------------------------------------------------------------------------
+all_candidates = [
+    p for p in (TMP / "images").rglob("*")
+    if p.is_file() and p.suffix.lower() in (IMAGE_EXT + VIDEO_EXT)
+]
+if not all_candidates:
+    raise SystemExit("No usable images/videos found in the images folder.")
+
+if TARGET_MEDIA_NAME:
+    matches = [p for p in all_candidates if p.name == TARGET_MEDIA_NAME]
+    if not matches:
+        raise SystemExit(f"Target media {TARGET_MEDIA_NAME} not found.")
+    media_path = matches[0]
+    pick_note = "explicitly requested"
+else:
+    media_path = random.choice(all_candidates)
+    pick_note = "auto-picked"
+print(f"[MEDIA] Using {media_path.name} ({pick_note})")
+
 log_manifest(media_path.name, "background_media", IMAGES_FOLDER,
-             "confirm original license/rights for this asset before publishing")
+             f"{pick_note}; confirm original license/rights for this asset before publishing")
 
 is_video = media_path.suffix.lower() in VIDEO_EXT
 is_image = media_path.suffix.lower() in IMAGE_EXT
-if not (is_video or is_image):
-    raise SystemExit(f"Unsupported media type: {media_path.suffix}")
 
 songs = list((TMP / "songs").glob("*.mp3"))
 if not songs:
@@ -213,17 +220,18 @@ with open(concat_path, "w") as f:
             f.write(f"file '{s}'\n")
 
 # ---------------------------------------------------------------------------
-# Bitrate math -- for a given DURATION, hit TARGET_SIZE_GB, hard-capped at
-# MAX_SIZE_BYTES by the size watcher below.
+# Bitrate math -- hit TARGET_SIZE_GB for this DURATION, hard-capped at
+# MAX_SIZE_BYTES (1.9GB) by the size watcher below, floor-checked at 1.0GB.
+# preset=slow (vs medium) buys meaningfully better quality per bit at the
+# cost of slower encode -- worth it since quality-per-MB is the actual ask.
 # ---------------------------------------------------------------------------
 target_bits = TARGET_SIZE_BYTES * 8
 target_total_kbps = target_bits / 1000 / DURATION
-video_bitrate_k = max(600, int(target_total_kbps - AUDIO_BITRATE_K))
+video_bitrate_k = max(800, int(target_total_kbps - AUDIO_BITRATE_K))
 print(f"[BITRATE] video={video_bitrate_k}k audio={AUDIO_BITRATE_K}k")
 
 # ---------------------------------------------------------------------------
-# Subscribe overlay schedule: first showing after a short random delay,
-# then a random 3-7 minute gap between each subsequent showing.
+# Subscribe overlay schedule
 # ---------------------------------------------------------------------------
 sub_schedule = []
 if sub_path:
@@ -242,6 +250,7 @@ if sub_path:
 label = CHANNEL_TAG or "render"
 ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 output_path = TMP / f"{label}_{media_path.stem}_{ts}.mp4"
+thumb_path = TMP / f"{label}_{media_path.stem}_{ts}_thumb.jpg"
 
 print(f"\n>>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
 print(f">>> DURATION : {DURATION}s ({DURATION // 60}m {DURATION % 60}s) @ {FPS}fps")
@@ -249,13 +258,6 @@ print(f">>> ZOOM     : {ZOOM_MIN}-{ZOOM_MAX}, {ZOOM_PERIOD_SECONDS/2:.0f}s in / 
 
 # ---------------------------------------------------------------------------
 # Filter graph
-#   - image source: oscillating zoompan, 7s in / 7s out, forever
-#   - video source: natural playback speed, looped if shorter than DURATION
-#   - fixed-position logo overlay (top-left)
-#   - fixed-position, chroma-keyed subscribe overlay (bottom-right),
-#     visible only during its scheduled windows
-#   - permanent "AI-generated content" disclosure label (bottom-left, so it
-#     never collides with the subscribe overlay)
 # ---------------------------------------------------------------------------
 if is_image:
     bg_input_args = ["-loop", "1", "-i", str(media_path)]
@@ -282,7 +284,6 @@ else:
 filter_parts = [bg_filter]
 video_label = "[bg]"
 next_input_index = 1
-audio_source_index = None
 
 logo_input_args = []
 if LOGO_PATH and Path(LOGO_PATH).exists():
@@ -309,7 +310,6 @@ if sub_path and sub_schedule:
     video_label = "[bgsub]"
     next_input_index += 1
 
-# Disclosure label -- bottom-left, always on, never overlaps the subscribe slot.
 disclosure_text = "AI-generated content"
 filter_parts.append(
     f"{video_label}drawtext=text='{disclosure_text}':fontcolor=white@0.75:fontsize=22:"
@@ -317,9 +317,7 @@ filter_parts.append(
 )
 
 filter_complex = ";".join(filter_parts)
-
-concat_input_index = next_input_index
-audio_input_index = concat_input_index
+audio_input_index = next_input_index
 
 cmd = [
     "ffmpeg", "-y",
@@ -331,12 +329,12 @@ cmd = [
     "-filter_complex", filter_complex,
     "-map", "[outv]",
     "-map", f"{audio_input_index}:a",
-    "-c:v", "libx264", "-preset", "medium",
+    "-c:v", "libx264", "-preset", "slow", "-profile:v", "high", "-pix_fmt", "yuv420p",
     "-b:v", f"{video_bitrate_k}k",
-    "-maxrate", f"{int(video_bitrate_k * 1.2)}k",
+    "-maxrate", f"{int(video_bitrate_k * 1.15)}k",
     "-bufsize", f"{int(video_bitrate_k * 2)}k",
     "-r", str(FPS), "-g", str(FPS * 2),
-    "-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_K}k", "-ar", "44100",
+    "-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_K}k", "-ar", "48000",
     "-movflags", "+faststart",
     str(output_path),
 ]
@@ -382,6 +380,23 @@ print(f"\nDONE -- {output_path}")
 print(f"Size   : {final_size_mb:.1f} MB")
 if final_size_bytes < MIN_SIZE_BYTES:
     print(f"[WARN] Output is under the 1.0GB floor -- consider raising TARGET_SIZE_GB or DURATION.")
+
+# ---------------------------------------------------------------------------
+# Thumbnail -- pull a frame from partway through so the release is
+# identifiable at a glance instead of just filename+timestamp.
+# ---------------------------------------------------------------------------
+try:
+    actual_duration = probe_duration(output_path)
+    grab_at = max(5, min(actual_duration * 0.15, actual_duration - 5))
+    subprocess.run([
+        "ffmpeg", "-y", "-ss", str(grab_at), "-i", str(output_path),
+        "-frames:v", "1", "-q:v", "2", str(thumb_path),
+    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print(f"Thumbnail: {thumb_path}")
+except Exception as e:
+    print(f"[WARN] thumbnail generation failed: {e}")
+    thumb_path = None
+
 print(f"Manifest updated at: {MANIFEST_PATH.resolve()}")
 print("\nReminder before publishing:")
 print(" 1. In YouTube Studio upload flow, toggle 'Altered or synthetic content' if applicable.")
@@ -392,6 +407,7 @@ github_output = os.environ.get("GITHUB_OUTPUT")
 if github_output:
     with open(github_output, "a") as f:
         f.write(f"output_path={output_path}\n")
+        f.write(f"thumb_path={thumb_path if thumb_path else ''}\n")
         f.write(f"media_name={media_path.name}\n")
         f.write(f"duration_seconds={DURATION}\n")
         f.write(f"final_size_mb={final_size_mb:.1f}\n")
