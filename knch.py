@@ -1,28 +1,25 @@
 """
-Ambient/lofi channel render script.
+Ambient/lofi channel render script -- fully self-contained.
+
+Everything (folder IDs, channel tag, size/zoom/sub settings) is hardcoded
+below. The workflow that runs this has zero inputs -- click "Run workflow"
+and it goes: download -> auto-pick media -> render -> thumbnail -> release.
 
 Pipeline:
   - Background image with a continuous oscillating zoom: 7s zoom-in,
-    7s zoom-out, forever (period = 14s).
-  - Fixed-position brand logo overlay (optional), same spot every render.
-  - Visible "AI-generated content" disclosure label baked into the video
-    (bottom-left) as the visual half of disclosure. Pair this with
-    YouTube Studio's "Altered or synthetic content" toggle at upload time
-    -- that's the metadata half, this script can't set it for you.
-  - A green-screen "Subscribe" clip keyed and overlaid bottom-right, on a
-    fixed position, appearing repeatedly at randomized 3-7 minute gaps.
-  - A thumbnail frame pulled from the finished render, so releases are
-    identifiable at a glance instead of just a filename+timestamp.
-  - asset_manifest.csv logs every asset used per render. You still need to
-    actually confirm/own the rights to every image/song/overlay you point
-    this at -- the manifest is a paper trail, not a license.
-
-If TARGET_MEDIA_NAME isn't set, one image/video is picked automatically
-from the downloaded images folder (uniform random) so this can run
-unattended end-to-end.
+    7s zoom-out, forever.
+  - Fixed-position brand logo overlay (optional).
+  - Visible "AI-generated content" disclosure label (bottom-left).
+    Pair with YouTube Studio's "Altered or synthetic content" toggle at
+    upload time -- that's the metadata half, this script can't set it.
+  - Green-screen "Subscribe" clip, chroma-keyed, fixed bottom-right,
+    appearing on randomized 3-7 minute gaps.
+  - Thumbnail frame pulled from the finished render for the release.
+  - asset_manifest.csv logs every asset used per render -- confirm/own
+    the rights to everything pointed at here; the manifest is a paper
+    trail, not a license.
 """
 
-import os
 import csv
 import random
 import subprocess
@@ -33,50 +30,56 @@ from pathlib import Path
 
 import gdown
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-TMP = Path("/tmp/render")
-IMAGES_FOLDER = os.environ.get("IMAGES_FOLDER_ID", "")
-SONGS_FOLDER = os.environ.get("SONGS_FOLDER_ID", "")
-SUB_FILE_ID = os.environ.get("SUB_FILE_ID", "")
+# ===========================================================================
+# HARDCODED CONFIG -- edit these directly, no workflow inputs needed
+# ===========================================================================
+IMAGES_FOLDER = "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"   # Drive folder: images1
+SONGS_FOLDER = "1DILwSnl-m4yY2w5J29hIlv19DnzNzVm_"     # Drive folder: songs
+SUB_FILE_ID = "1PsqVZyJZbyy8oh5LQoKkgms7bGkkJquY"      # Drive file: subscribe green-screen clip
 
-LOGO_PATH = os.environ.get("LOGO_PATH", "")
-CHANNEL_TAG = os.environ.get("CHANNEL_TAG", "")
+CHANNEL_TAG = "render"
+LOGO_PATH = ""  # e.g. "assets/logo.png" relative to repo root, blank = no logo overlay
 
-DURATION = int(os.environ.get("DURATION_SECONDS") or random.randint(3600, 10800))
+TARGET_MEDIA_NAME = ""      # blank = auto-pick a random file from IMAGES_FOLDER every run
+DURATION_MIN_SEC = 3600     # 1 hour
+DURATION_MAX_SEC = 10800    # 3 hours
+
 FPS = 24
-
-ZOOM_MIN = float(os.environ.get("ZOOM_MIN", "1.0"))
-ZOOM_MAX = float(os.environ.get("ZOOM_MAX", "1.15"))
-ZOOM_PERIOD_SECONDS = 14.0
+ZOOM_MIN = 1.0
+ZOOM_MAX = 1.15
+ZOOM_PERIOD_SECONDS = 14.0  # 7s in / 7s out, forever
 
 AUDIO_BITRATE_K = 192
-TARGET_SIZE_GB = float(os.environ.get("TARGET_SIZE_GB", "1.5"))
-TARGET_SIZE_BYTES = int(TARGET_SIZE_GB * 1024 * 1024 * 1024)
-MIN_SIZE_BYTES = int(1.0 * 1024 * 1024 * 1024)
-MAX_SIZE_BYTES = int(1.9 * 1024 * 1024 * 1024)
+TARGET_SIZE_GB = 1.5        # aim point
+MIN_SIZE_GB = 1.0           # floor (warn only, not enforced)
+MAX_SIZE_GB = 1.9           # hard cap, encode is stopped if hit
 
-SUB_GAP_MIN_SEC = 180
-SUB_GAP_MAX_SEC = 420
-SUB_MAX_SHOW_SECONDS = float(os.environ.get("SUB_MAX_SHOW_SECONDS", "6"))
-SUB_CHROMA_COLOR = os.environ.get("SUB_CHROMA_COLOR", "0x00FF00")
-SUB_CHROMA_SIMILARITY = os.environ.get("SUB_CHROMA_SIMILARITY", "0.18")
-SUB_CHROMA_BLEND = os.environ.get("SUB_CHROMA_BLEND", "0.06")
-SUB_SCALE_WIDTH = os.environ.get("SUB_SCALE_WIDTH", "340")
+SUB_GAP_MIN_SEC = 180       # 3 min
+SUB_GAP_MAX_SEC = 420       # 7 min
+SUB_MAX_SHOW_SECONDS = 6.0
+SUB_CHROMA_COLOR = "0x00FF00"
+SUB_CHROMA_SIMILARITY = "0.18"
+SUB_CHROMA_BLEND = "0.06"
+SUB_SCALE_WIDTH = "340"
 
+MANIFEST_PATH = Path("asset_manifest.csv")
+TMP = Path("/tmp/render")
 IMAGE_EXT = (".png", ".jpg", ".jpeg")
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi")
 
-TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME", "").strip()
+TARGET_SIZE_BYTES = int(TARGET_SIZE_GB * 1024 * 1024 * 1024)
+MIN_SIZE_BYTES = int(MIN_SIZE_GB * 1024 * 1024 * 1024)
+MAX_SIZE_BYTES = int(MAX_SIZE_GB * 1024 * 1024 * 1024)
+DURATION = random.randint(DURATION_MIN_SEC, DURATION_MAX_SEC)
 
 TMP.mkdir(parents=True, exist_ok=True)
 (TMP / "images").mkdir(exist_ok=True)
 (TMP / "songs").mkdir(exist_ok=True)
 
-MANIFEST_PATH = Path(os.environ.get("MANIFEST_PATH", "asset_manifest.csv"))
 
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def log_manifest(filename: str, kind: str, source_folder_id: str, note: str = ""):
     is_new = not MANIFEST_PATH.exists()
     with open(MANIFEST_PATH, "a", newline="") as f:
@@ -150,12 +153,16 @@ def probe_duration(path) -> float:
 # ---------------------------------------------------------------------------
 # Disk check
 # ---------------------------------------------------------------------------
+import os
 stat = os.statvfs(str(TMP))
 free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
 print(f"[DISK] Free space: {free_gb:.1f} GB")
 if free_gb < 4.0:
     raise SystemExit(f"[DISK] Not enough free space ({free_gb:.1f} GB).")
 
+# ---------------------------------------------------------------------------
+# Download everything -- images folder, songs folder, sub overlay clip
+# ---------------------------------------------------------------------------
 print("Downloading media...")
 retrying_download_folder(IMAGES_FOLDER, TMP / "images", "media")
 print("Downloading songs...")
@@ -170,8 +177,8 @@ if SUB_FILE_ID:
                  "confirm you have rights to use/host this asset")
 
 # ---------------------------------------------------------------------------
-# Pick source media -- explicit name if given, otherwise auto-pick so this
-# can run fully unattended.
+# Pick source media -- explicit name if set above, otherwise auto-pick so
+# this runs fully unattended, no prompts, no inputs.
 # ---------------------------------------------------------------------------
 all_candidates = [
     p for p in (TMP / "images").rglob("*")
@@ -221,9 +228,8 @@ with open(concat_path, "w") as f:
 
 # ---------------------------------------------------------------------------
 # Bitrate math -- hit TARGET_SIZE_GB for this DURATION, hard-capped at
-# MAX_SIZE_BYTES (1.9GB) by the size watcher below, floor-checked at 1.0GB.
-# preset=slow (vs medium) buys meaningfully better quality per bit at the
-# cost of slower encode -- worth it since quality-per-MB is the actual ask.
+# MAX_SIZE_BYTES (1.9GB) by the size watcher, floor-checked at 1.0GB.
+# preset=slow buys meaningfully better quality per bit than medium.
 # ---------------------------------------------------------------------------
 target_bits = TARGET_SIZE_BYTES * 8
 target_total_kbps = target_bits / 1000 / DURATION
@@ -231,7 +237,7 @@ video_bitrate_k = max(800, int(target_total_kbps - AUDIO_BITRATE_K))
 print(f"[BITRATE] video={video_bitrate_k}k audio={AUDIO_BITRATE_K}k")
 
 # ---------------------------------------------------------------------------
-# Subscribe overlay schedule
+# Subscribe overlay schedule -- randomized 3-7 min gaps, fixed position
 # ---------------------------------------------------------------------------
 sub_schedule = []
 if sub_path:
@@ -379,11 +385,10 @@ final_size_bytes = output_path.stat().st_size
 print(f"\nDONE -- {output_path}")
 print(f"Size   : {final_size_mb:.1f} MB")
 if final_size_bytes < MIN_SIZE_BYTES:
-    print(f"[WARN] Output is under the 1.0GB floor -- consider raising TARGET_SIZE_GB or DURATION.")
+    print(f"[WARN] Output is under the 1.0GB floor -- consider raising TARGET_SIZE_GB or DURATION_MIN_SEC.")
 
 # ---------------------------------------------------------------------------
-# Thumbnail -- pull a frame from partway through so the release is
-# identifiable at a glance instead of just filename+timestamp.
+# Thumbnail -- pull a frame from partway through for the release
 # ---------------------------------------------------------------------------
 try:
     actual_duration = probe_duration(output_path)
