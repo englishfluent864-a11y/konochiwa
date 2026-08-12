@@ -1,38 +1,11 @@
 name: Render
-# One click, nothing required to fill in: media is auto-picked from the
-# images folder each run, duration is a random 1-3hr, size targets
-# 1.0-1.9GB. Override any of the inputs below only if you want to.
+# No inputs, no fields, nothing to fill in. Click "Run workflow" and every
+# step below runs back-to-back automatically: download images/songs/sub
+# clip, auto-pick a background, render, generate a thumbnail, publish a
+# release. All config (folder IDs, channel tag, size/zoom/sub settings)
+# lives in render.py -- edit it there if you need to change anything.
 on:
   workflow_dispatch:
-    inputs:
-      media_name:
-        description: "Optional: exact filename to force this run to use. Leave blank to auto-pick."
-        required: false
-        type: string
-      duration_seconds:
-        description: "Optional: video length in seconds. Leave blank for a random 1-3hr."
-        required: false
-        type: string
-      channel_tag:
-        description: "Short tag if you run more than one distinct channel"
-        required: false
-        type: string
-        default: "render"
-      images_folder_id:
-        description: "Google Drive folder ID for background images"
-        required: false
-        type: string
-        default: "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"
-      songs_folder_id:
-        description: "Google Drive folder ID for songs"
-        required: false
-        type: string
-        default: "1DILwSnl-m4yY2w5J29hIlv19DnzNzVm_"
-      sub_file_id:
-        description: "Google Drive file ID for the green-screen subscribe clip"
-        required: false
-        type: string
-        default: "1PsqVZyJZbyy8oh5LQoKkgms7bGkkJquY"
 permissions:
   contents: write
 jobs:
@@ -56,18 +29,6 @@ jobs:
           pip install gdown --break-system-packages
       - name: Run render
         id: render
-        env:
-          TARGET_MEDIA_NAME: ${{ inputs.media_name }}
-          DURATION_SECONDS: ${{ inputs.duration_seconds }}
-          CHANNEL_TAG: ${{ inputs.channel_tag }}
-          IMAGES_FOLDER_ID: ${{ inputs.images_folder_id }}
-          SONGS_FOLDER_ID: ${{ inputs.songs_folder_id }}
-          SUB_FILE_ID: ${{ inputs.sub_file_id }}
-          LOGO_PATH: ${{ github.workspace }}/assets/logo.png
-          TARGET_SIZE_GB: "1.5"
-          ZOOM_MIN: "1.0"
-          ZOOM_MAX: "1.15"
-          SUB_MAX_SHOW_SECONDS: "6"
         run: python render.py
       - name: Upload asset manifest as workflow artifact
         uses: actions/upload-artifact@v4
@@ -79,8 +40,8 @@ jobs:
         id: tag
         run: |
           TS=$(date -u +"%Y%m%d_%H%M%S")
-          echo "tag=${{ inputs.channel_tag }}_${TS}" >> $GITHUB_OUTPUT
-          echo "title=${{ inputs.channel_tag }} ${TS} -- ${{ steps.render.outputs.media_name }}" >> $GITHUB_OUTPUT
+          echo "tag=render_${TS}" >> $GITHUB_OUTPUT
+          echo "title=render ${TS} -- ${{ steps.render.outputs.media_name }}" >> $GITHUB_OUTPUT
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -102,3 +63,4 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
