@@ -125,10 +125,11 @@ def retrying_download_folder(folder_id, out_dir, label, attempts=3):
 
 
 def retrying_download_file(file_id, out_path, label, attempts=3):
+    url = f"https://drive.google.com/uc?id={file_id}"
     for attempt in range(attempts):
         try:
             download_with_timeout(
-                lambda: gdown.download(id=file_id, output=str(out_path), quiet=False, fuzzy=True),
+                lambda: gdown.download(url=url, output=str(out_path), quiet=False),
                 timeout_sec=600,
                 label=label,
             )
