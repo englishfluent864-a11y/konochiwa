@@ -1,9 +1,17 @@
 name: Render
 # No inputs, no fields, nothing to fill in. Click "Run workflow" and every
-# step below runs back-to-back automatically: download images/songs/sub
-# clip, auto-pick a background, render, generate a thumbnail, publish a
-# release. All config (folder IDs, channel tag, size/zoom/sub settings)
-# lives in render.py -- edit it there if you need to change anything.
+# step below runs back-to-back automatically. All config (folder IDs,
+# channel tag, size/zoom/sub settings) lives in render.py.
+#
+# Running on GitHub's shared runner (ubuntu-latest). GitHub enforces a
+# HARD 6-hour (360 min) cap on every job on these runners -- not
+# adjustable by timeout-minutes or any account tier. timeout-minutes is
+# set to 345 below to leave ~15 min of buffer for checkout/deps/upload
+# steps before that platform limit could hit mid-job.
+#
+# render.py's DURATION_MAX_SEC is capped at 2.5 hours (9000s) to leave
+# real margin under this ceiling. If renders keep finishing with time to
+# spare, DURATION_MAX_SEC can be raised back up in render.py.
 on:
   workflow_dispatch:
 permissions:
@@ -11,7 +19,7 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 345
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,4 +71,3 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
