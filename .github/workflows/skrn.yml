@@ -1,15 +1,16 @@
 name: Render
-# Deliberately manual -- you pick the source file per run instead of
-# auto-fanning across an entire folder.
+# One click, nothing required to fill in: media is auto-picked from the
+# images folder each run, duration is a random 1-3hr, size targets
+# 1.0-1.9GB. Override any of the inputs below only if you want to.
 on:
   workflow_dispatch:
     inputs:
       media_name:
-        description: "Exact filename of the background image/video to use for this run"
-        required: true
+        description: "Optional: exact filename to force this run to use. Leave blank to auto-pick."
+        required: false
         type: string
       duration_seconds:
-        description: "Video length in seconds (leave blank for a random 1-3hr)"
+        description: "Optional: video length in seconds. Leave blank for a random 1-3hr."
         required: false
         type: string
       channel_tag:
@@ -79,20 +80,25 @@ jobs:
         run: |
           TS=$(date -u +"%Y%m%d_%H%M%S")
           echo "tag=${{ inputs.channel_tag }}_${TS}" >> $GITHUB_OUTPUT
-          echo "title=${{ inputs.channel_tag }} ${TS}" >> $GITHUB_OUTPUT
+          echo "title=${{ inputs.channel_tag }} ${TS} -- ${{ steps.render.outputs.media_name }}" >> $GITHUB_OUTPUT
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "${{ steps.tag.outputs.title }}"
           body: |
-            Source: ${{ inputs.media_name }}
+            Source: ${{ steps.render.outputs.media_name }}
+            Duration: ${{ steps.render.outputs.duration_seconds }}s
             Size: ${{ steps.render.outputs.final_size_mb }} MB
+            A thumbnail image is attached alongside the video so you can
+            tell releases apart at a glance.
             Before publishing to YouTube:
             - Toggle "Altered or synthetic content" in Studio if applicable
             - Write a unique title/description/thumbnail for this upload
             - Check asset_manifest.csv for this video's licensing sources
-          files: ${{ steps.render.outputs.output_path }}
+          files: |
+            ${{ steps.render.outputs.output_path }}
+            ${{ steps.render.outputs.thumb_path }}
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
