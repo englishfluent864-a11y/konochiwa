@@ -42,7 +42,7 @@ LOGO_PATH = ""  # e.g. "assets/logo.png" relative to repo root, blank = no logo 
 
 TARGET_MEDIA_NAME = ""      # blank = auto-pick a random file from IMAGES_FOLDER every run
 DURATION_MIN_SEC = 3600     # 1 hour
-DURATION_MAX_SEC = 10800    # 3 hours
+DURATION_MAX_SEC = 9000      # 2.5 hours -- leaves real margin under GitHub's 6h hard job cap
 
 FPS = 24
 ZOOM_MIN = 1.0
@@ -273,9 +273,11 @@ if is_image:
     amp = (ZOOM_MAX - ZOOM_MIN) / 2
     mid = ZOOM_MIN + amp
     zoom_expr = f"{mid}+{amp}*sin(2*PI*on/{period_frames})"
+    # Headroom of 2560x1440 (not a full 4K upscale) is plenty for a 15% zoom
+    # and is far cheaper to process per-frame over a multi-hour render.
     bg_filter = (
-        f"[0:v]scale=3840:2160:force_original_aspect_ratio=increase,"
-        f"crop=3840:2160,"
+        f"[0:v]scale=2560:1440:force_original_aspect_ratio=increase,"
+        f"crop=2560:1440,"
         f"zoompan=z='{zoom_expr}':"
         f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
         f"d={zoom_frames}:s=1920x1080:fps={FPS},"
@@ -336,7 +338,7 @@ cmd = [
     "-filter_complex", filter_complex,
     "-map", "[outv]",
     "-map", f"{audio_input_index}:a",
-    "-c:v", "libx264", "-preset", "slow", "-profile:v", "high", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-pix_fmt", "yuv420p",
     "-b:v", f"{video_bitrate_k}k",
     "-maxrate", f"{int(video_bitrate_k * 1.15)}k",
     "-bufsize", f"{int(video_bitrate_k * 2)}k",
