@@ -1,25 +1,81 @@
 name: Render
-# No inputs, no fields, nothing to fill in. Click "Run workflow" and every
-# step below runs back-to-back automatically. All config (folder IDs,
-# channel tag, size/zoom/sub settings) lives in render.py.
+# Two jobs:
+#   1. discover -- lists every file in IMAGES_FOLDER (no download) and turns
+#      it into a matrix, so this workflow can fan out to one job per image.
+#   2. render -- a matrix job, one per image. GitHub runs up to your plan's
+#      concurrent-job limit at once (20 on Free, 40 Pro, 60 Team) and
+#      automatically queues the rest, starting each as a slot frees up,
+#      until every image has been rendered. No extra scheduling code needed.
 #
-# Running on GitHub's shared runner (ubuntu-latest). GitHub enforces a
-# HARD 6-hour (360 min) cap on every job on these runners -- not
-# adjustable by timeout-minutes or any account tier. timeout-minutes is
-# set to 345 below to leave ~15 min of buffer for checkout/deps/upload
-# steps before that platform limit could hit mid-job.
+# Hard platform limits this design lives inside (not adjustable by any
+# setting in this repo):
+#   - 6h max per individual job on GitHub-hosted runners
+#   - 256 max jobs per matrix in one workflow run -- if IMAGES_FOLDER has
+#     more than 256 files, only the first 256 render on this trigger; the
+#     discover step logs a warning listing how many were skipped. Click
+#     "Run workflow" again afterward for the rest. (A future improvement
+#     would be to have the last render job auto re-dispatch this workflow
+#     when files remain -- ask if you want that added.)
+#   - 35 days max for a whole workflow run, including queued time
 #
-# render.py's DURATION_MAX_SEC is capped at 2.5 hours (9000s) to leave
-# real margin under this ceiling. If renders keep finishing with time to
+# render.py's DURATION_MAX_SEC is capped at 2.5 hours (9000s) to leave real
+# margin under the 6h/job ceiling. If renders keep finishing with time to
 # spare, DURATION_MAX_SEC can be raised back up in render.py.
 on:
   workflow_dispatch:
 permissions:
   contents: write
 jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install gdown
+        run: pip install gdown --break-system-packages
+      - name: List images (no download)
+        id: list
+        run: |
+          python3 - <<'PYEOF'
+          import gdown, json, os
+
+          IMAGES_FOLDER = "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"
+          MAX_MATRIX_JOBS = 256  # GitHub's hard per-workflow-run matrix cap
+
+          files = gdown.download_folder(
+              id=IMAGES_FOLDER, skip_download=True, remaining_ok=True, quiet=True
+          )
+          names = sorted({f.path.split("/")[-1] for f in files})
+
+          if not names:
+              raise SystemExit("No files found in IMAGES_FOLDER -- check the folder ID/sharing.")
+
+          if len(names) > MAX_MATRIX_JOBS:
+              skipped = len(names) - MAX_MATRIX_JOBS
+              print(f"::warning::{len(names)} files found; GitHub's matrix cap is {MAX_MATRIX_JOBS} "
+                    f"jobs per run, so {skipped} are skipped this trigger. Run workflow_dispatch "
+                    f"again to pick up the rest (this list is alphabetical, so re-running will "
+                    f"start from the same beginning -- track which releases already exist if you "
+                    f"want to avoid re-rendering the same images).")
+              names = names[:MAX_MATRIX_JOBS]
+
+          matrix = json.dumps({"media": names})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={matrix}\n")
+              f.write(f"count={len(names)}\n")
+          PYEOF
+
   render:
+    needs: discover
+    if: needs.discover.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,18 +93,22 @@ jobs:
           pip install gdown --break-system-packages
       - name: Run render
         id: render
+        env:
+          TARGET_MEDIA_NAME: ${{ matrix.media }}
         run: python render.py
       - name: Upload asset manifest as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: asset-manifest
+          # Unique per matrix job -- concurrent jobs can't share one artifact name.
+          name: asset-manifest-${{ strategy.job-index }}
           path: asset_manifest.csv
           if-no-files-found: warn
       - name: Tag release
         id: tag
         run: |
           TS=$(date -u +"%Y%m%d_%H%M%S")
-          echo "tag=render_${TS}" >> $GITHUB_OUTPUT
+          # job-index appended so two jobs finishing in the same second never collide.
+          echo "tag=render_${TS}_${{ strategy.job-index }}" >> $GITHUB_OUTPUT
           echo "title=render ${TS} -- ${{ steps.render.outputs.media_name }}" >> $GITHUB_OUTPUT
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -64,7 +124,7 @@ jobs:
             Before publishing to YouTube:
             - Toggle "Altered or synthetic content" in Studio if applicable
             - Write a unique title/description/thumbnail for this upload
-            - Check asset_manifest.csv for this video's licensing sources
+            - Check the asset-manifest artifact for this video's licensing sources
           files: |
             ${{ steps.render.outputs.output_path }}
             ${{ steps.render.outputs.thumb_path }}
