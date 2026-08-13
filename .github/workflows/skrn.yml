@@ -35,7 +35,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install gdown
-        run: pip install gdown --break-system-packages
+        run: pip install "gdown==6.1.0" --break-system-packages
       - name: List images (no download)
         id: list
         run: |
@@ -46,7 +46,8 @@ jobs:
           MAX_MATRIX_JOBS = 256  # GitHub's hard per-workflow-run matrix cap
 
           files = gdown.download_folder(
-              id=IMAGES_FOLDER, skip_download=True, remaining_ok=True, quiet=True
+              id=IMAGES_FOLDER, skip_download=True, quiet=True
+              # gdown v6+ removed remaining_ok: folders >50 files work by default now.
           )
           names = sorted({f.path.split("/")[-1] for f in files})
 
@@ -90,7 +91,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg --fix-missing
-          pip install gdown --break-system-packages
+          pip install "gdown==6.1.0" --break-system-packages
       - name: Run render
         id: render
         env:
