@@ -5,6 +5,12 @@ Everything (folder IDs, channel tag, size/zoom/sub settings) is hardcoded
 below. The workflow that runs this has zero inputs -- click "Run workflow"
 and it goes: download -> auto-pick media -> render -> thumbnail -> release.
 
+CI/queue mode: when run.yml's `render` job runs this as part of a matrix,
+it sets the TARGET_MEDIA_NAME env var per-job so each job renders a
+different source image instead of all of them racing to auto-pick the
+same random file. Manual single runs (no env var set) keep the original
+auto-pick behavior.
+
 Pipeline:
   - Background image with a continuous oscillating zoom: 7s zoom-in,
     7s zoom-out, forever.
@@ -21,6 +27,7 @@ Pipeline:
 """
 
 import csv
+import os
 import random
 import subprocess
 import threading
@@ -40,7 +47,9 @@ SUB_FILE_ID = "1PsqVZyJZbyy8oh5LQoKkgms7bGkkJquY"      # Drive file: subscribe g
 CHANNEL_TAG = "render"
 LOGO_PATH = ""  # e.g. "assets/logo.png" relative to repo root, blank = no logo overlay
 
-TARGET_MEDIA_NAME = ""      # blank = auto-pick a random file from IMAGES_FOLDER every run
+# CI matrix jobs pass TARGET_MEDIA_NAME as an env var so each job renders a
+# different image. Manual/local runs leave it unset -> auto-pick random file.
+TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME", "")
 DURATION_MIN_SEC = 3600     # 1 hour
 DURATION_MAX_SEC = 9000      # 2.5 hours -- leaves real margin under GitHub's 6h hard job cap
 
@@ -112,7 +121,12 @@ def retrying_download_folder(folder_id, out_dir, label, attempts=3):
     for attempt in range(attempts):
         try:
             download_with_timeout(
-                lambda: gdown.download_folder(id=folder_id, output=str(out_dir), quiet=False),
+                lambda: gdown.download_folder(
+                    id=folder_id,
+                    output=str(out_dir),
+                    quiet=False,
+                    remaining_ok=True,  # gdown default caps folders at 50 files without this
+                ),
                 timeout_sec=900,
                 label=label,
             )
@@ -154,7 +168,6 @@ def probe_duration(path) -> float:
 # ---------------------------------------------------------------------------
 # Disk check
 # ---------------------------------------------------------------------------
-import os
 stat = os.statvfs(str(TMP))
 free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
 print(f"[DISK] Free space: {free_gb:.1f} GB")
@@ -178,8 +191,9 @@ if SUB_FILE_ID:
                  "confirm you have rights to use/host this asset")
 
 # ---------------------------------------------------------------------------
-# Pick source media -- explicit name if set above, otherwise auto-pick so
-# this runs fully unattended, no prompts, no inputs.
+# Pick source media -- explicit name if set above (or via TARGET_MEDIA_NAME
+# env var from a CI matrix job), otherwise auto-pick so this runs fully
+# unattended, no prompts, no inputs.
 # ---------------------------------------------------------------------------
 all_candidates = [
     p for p in (TMP / "images").rglob("*")
