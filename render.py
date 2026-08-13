@@ -125,7 +125,8 @@ def retrying_download_folder(folder_id, out_dir, label, attempts=3):
                     id=folder_id,
                     output=str(out_dir),
                     quiet=False,
-                    remaining_ok=True,  # gdown default caps folders at 50 files without this
+                    # gdown v6+ removed remaining_ok/--remaining-ok: folder
+                    # downloads no longer cap at 50 files, no flag needed.
                 ),
                 timeout_sec=900,
                 label=label,
