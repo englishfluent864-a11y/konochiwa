@@ -1,134 +1,491 @@
-name: Render
-# Two jobs:
-#   1. discover -- lists every file in IMAGES_FOLDER (no download) and turns
-#      it into a matrix, so this workflow can fan out to one job per image.
-#   2. render -- a matrix job, one per image. GitHub runs up to your plan's
-#      concurrent-job limit at once (20 on Free, 40 Pro, 60 Team) and
-#      automatically queues the rest, starting each as a slot frees up,
-#      until every image has been rendered. No extra scheduling code needed.
-#
-# Hard platform limits this design lives inside (not adjustable by any
-# setting in this repo):
-#   - 6h max per individual job on GitHub-hosted runners
-#   - 256 max jobs per matrix in one workflow run -- if IMAGES_FOLDER has
-#     more than 256 files, only the first 256 render on this trigger; the
-#     discover step logs a warning listing how many were skipped. Click
-#     "Run workflow" again afterward for the rest. (A future improvement
-#     would be to have the last render job auto re-dispatch this workflow
-#     when files remain -- ask if you want that added.)
-#   - 35 days max for a whole workflow run, including queued time
-#
-# render.py's DURATION_MAX_SEC is capped at 2.5 hours (9000s) to leave real
-# margin under the 6h/job ceiling. If renders keep finishing with time to
-# spare, DURATION_MAX_SEC can be raised back up in render.py.
-on:
-  workflow_dispatch:
-permissions:
-  contents: write
-jobs:
-  discover:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.list.outputs.matrix }}
-      count: ${{ steps.list.outputs.count }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install gdown
-        run: pip install "gdown==6.1.0" --break-system-packages
-      - name: List images (no download)
-        id: list
-        run: |
-          python3 - <<'PYEOF'
-          import gdown, json, os
+"""
+Ambient/lofi channel render script -- fully self-contained.
 
-          IMAGES_FOLDER = "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"
-          MAX_MATRIX_JOBS = 256  # GitHub's hard per-workflow-run matrix cap
+Everything (folder IDs, channel tag, size/zoom/sub settings) is hardcoded
+below. The workflow that runs this has zero inputs -- click "Run workflow"
+and it goes: download -> auto-pick media -> render -> thumbnail -> release.
 
-          files = gdown.download_folder(
-              id=IMAGES_FOLDER, skip_download=True, quiet=True
-              # gdown v6+ removed remaining_ok: folders >50 files work by default now.
-          )
-          names = sorted({f.path.split("/")[-1] for f in files})
+CI/queue mode: when run.yml's `render` job runs this as part of a matrix,
+it sets the TARGET_MEDIA_NAME env var per-job so each job renders a
+different source image instead of all of them racing to auto-pick the
+same random file. Manual single runs (no env var set) keep the original
+auto-pick behavior.
 
-          if not names:
-              raise SystemExit("No files found in IMAGES_FOLDER -- check the folder ID/sharing.")
+Pipeline:
+  - Background image with a continuous oscillating zoom: same 1.0-1.15
+    zoom range as always, but the cycle length (how long one in+out
+    breath takes) is picked randomly per render from ZOOM_PERIOD_OPTIONS,
+    so consecutive uploads don't all pulse at the same identical pace.
+  - Fixed-position brand logo overlay (optional).
+  - Visible "AI-generated content" disclosure label (bottom-left).
+    Pair with YouTube Studio's "Altered or synthetic content" toggle at
+    upload time -- that's the metadata half, this script can't set it.
+  - Green-screen "Subscribe" clip, chroma-keyed (+despill for a clean
+    edge), fixed bottom-right, appearing on randomized 3-7 minute gaps.
+    If the clip itself has an audio track, it's mixed in at 5% volume,
+    only during the seconds it's actually shown on screen, ducked under
+    the music. If it has no audio track, it stays silent as before.
+  - Thumbnail frame pulled from the finished render for the release.
+  - asset_manifest.csv logs every asset used per render -- confirm/own
+    the rights to everything pointed at here; the manifest is a paper
+    trail, not a license.
+"""
 
-          if len(names) > MAX_MATRIX_JOBS:
-              skipped = len(names) - MAX_MATRIX_JOBS
-              print(f"::warning::{len(names)} files found; GitHub's matrix cap is {MAX_MATRIX_JOBS} "
-                    f"jobs per run, so {skipped} are skipped this trigger. Run workflow_dispatch "
-                    f"again to pick up the rest (this list is alphabetical, so re-running will "
-                    f"start from the same beginning -- track which releases already exist if you "
-                    f"want to avoid re-rendering the same images).")
-              names = names[:MAX_MATRIX_JOBS]
+import csv
+import os
+import random
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-          matrix = json.dumps({"media": names})
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"matrix={matrix}\n")
-              f.write(f"count={len(names)}\n")
-          PYEOF
+import gdown
 
-  render:
-    needs: discover
-    if: needs.discover.outputs.count != '0'
-    runs-on: ubuntu-latest
-    timeout-minutes: 345
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          sudo apt-get clean
-          docker system prune -af || true
-          df -h
-      - name: Install deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg --fix-missing
-          pip install "gdown==6.1.0" --break-system-packages
-      - name: Run render
-        id: render
-        env:
-          TARGET_MEDIA_NAME: ${{ matrix.media }}
-        run: python render.py
-      - name: Upload asset manifest as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          # Unique per matrix job -- concurrent jobs can't share one artifact name.
-          name: asset-manifest-${{ strategy.job-index }}
-          path: asset_manifest.csv
-          if-no-files-found: warn
-      - name: Tag release
-        id: tag
-        run: |
-          TS=$(date -u +"%Y%m%d_%H%M%S")
-          # job-index appended so two jobs finishing in the same second never collide.
-          echo "tag=render_${TS}_${{ strategy.job-index }}" >> $GITHUB_OUTPUT
-          echo "title=render ${TS} -- ${{ steps.render.outputs.media_name }}" >> $GITHUB_OUTPUT
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "${{ steps.tag.outputs.title }}"
-          body: |
-            Source: ${{ steps.render.outputs.media_name }}
-            Duration: ${{ steps.render.outputs.duration_seconds }}s
-            Size: ${{ steps.render.outputs.final_size_mb }} MB
-            A thumbnail image is attached alongside the video so you can
-            tell releases apart at a glance.
-            Before publishing to YouTube:
-            - Toggle "Altered or synthetic content" in Studio if applicable
-            - Write a unique title/description/thumbnail for this upload
-            - Check the asset-manifest artifact for this video's licensing sources
-          files: |
-            ${{ steps.render.outputs.output_path }}
-            ${{ steps.render.outputs.thumb_path }}
-          fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# ===========================================================================
+# HARDCODED CONFIG -- edit these directly, no workflow inputs needed
+# ===========================================================================
+IMAGES_FOLDER = "1bbYxw2pNbVS05liS0pObjxevuJ-BdXck"   # Drive folder: images1
+SONGS_FOLDER = "1DILwSnl-m4yY2w5J29hIlv19DnzNzVm_"     # Drive folder: songs
+SUB_FILE_ID = "1PsqVZyJZbyy8oh5LQoKkgms7bGkkJquY"      # Drive file: subscribe green-screen clip
+
+CHANNEL_TAG = "render"
+LOGO_PATH = ""  # e.g. "assets/logo.png" relative to repo root, blank = no logo overlay
+
+# CI matrix jobs pass TARGET_MEDIA_NAME as an env var so each job renders a
+# different image. Manual/local runs leave it unset -> auto-pick random file.
+TARGET_MEDIA_NAME = os.environ.get("TARGET_MEDIA_NAME", "")
+DURATION_MIN_SEC = 3600     # 1 hour
+DURATION_MAX_SEC = 9000      # 2.5 hours -- leaves real margin under GitHub's 6h hard job cap
+
+FPS = 24
+ZOOM_MIN = 1.0
+ZOOM_MAX = 1.15
+# Cycle length is randomized per render (not fixed) so the "breathing" pace
+# varies between uploads instead of feeling identical every time. Same
+# zoom range/style every render -- only the speed of one in+out cycle
+# changes. Add/remove values here to widen or narrow the variety.
+ZOOM_PERIOD_OPTIONS = [8.0, 10.0, 12.0, 15.0, 18.0, 20.0]
+ZOOM_PERIOD_SECONDS = random.choice(ZOOM_PERIOD_OPTIONS)
+
+AUDIO_BITRATE_K = 192
+TARGET_SIZE_GB = 1.5        # aim point
+MIN_SIZE_GB = 1.0           # floor (warn only, not enforced)
+MAX_SIZE_GB = 1.9           # hard cap, encode is stopped if hit
+
+SUB_GAP_MIN_SEC = 180       # 3 min
+SUB_GAP_MAX_SEC = 420       # 7 min
+SUB_MAX_SHOW_SECONDS = 6.0
+SUB_CHROMA_COLOR = "0x00FF00"
+# Tightened for a cleaner key on a flat, saturated green background.
+SUB_CHROMA_SIMILARITY = "0.14"
+SUB_CHROMA_BLEND = "0.10"
+SUB_SCALE_WIDTH = "340"
+# Despill strength -- pulls residual green fringe off the edges/highlights
+# left behind after chromakey without eating into the subject itself.
+SUB_DESPILL_MIX = "0.4"
+SUB_DESPILL_EXPAND = "0.1"
+# Clip audio (only used if the source clip actually has an audio track --
+# detected automatically below). Kept quiet and ducked under the music,
+# and only heard during the seconds the popup is actually on screen.
+SUB_AUDIO_VOLUME = 0.05
+
+MANIFEST_PATH = Path("asset_manifest.csv")
+TMP = Path("/tmp/render")
+IMAGE_EXT = (".png", ".jpg", ".jpeg")
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi")
+
+TARGET_SIZE_BYTES = int(TARGET_SIZE_GB * 1024 * 1024 * 1024)
+MIN_SIZE_BYTES = int(MIN_SIZE_GB * 1024 * 1024 * 1024)
+MAX_SIZE_BYTES = int(MAX_SIZE_GB * 1024 * 1024 * 1024)
+DURATION = random.randint(DURATION_MIN_SEC, DURATION_MAX_SEC)
+
+TMP.mkdir(parents=True, exist_ok=True)
+(TMP / "images").mkdir(exist_ok=True)
+(TMP / "songs").mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def log_manifest(filename: str, kind: str, source_folder_id: str, note: str = ""):
+    is_new = not MANIFEST_PATH.exists()
+    with open(MANIFEST_PATH, "a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(["timestamp_utc", "filename", "kind", "source_folder_id", "note"])
+        w.writerow([datetime.now(timezone.utc).isoformat(), filename, kind, source_folder_id, note])
+
+
+def download_with_timeout(fn, timeout_sec=1800, label="download"):
+    result, error = [None], [None]
+
+    def worker():
+        try:
+            result[0] = fn()
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        raise TimeoutError(f"{label} timed out after {timeout_sec}s")
+    if error[0]:
+        raise error[0]
+    return result[0]
+
+
+def retrying_download_folder(folder_id, out_dir, label, attempts=3):
+    for attempt in range(attempts):
+        try:
+            download_with_timeout(
+                lambda: gdown.download_folder(
+                    id=folder_id,
+                    output=str(out_dir),
+                    quiet=False,
+                    # gdown v6+ removed remaining_ok/--remaining-ok: folder
+                    # downloads no longer cap at 50 files, no flag needed.
+                ),
+                timeout_sec=900,
+                label=label,
+            )
+            return
+        except Exception as e:
+            print(f"[{label}] attempt {attempt + 1} failed: {e}")
+            if attempt == attempts - 1:
+                raise SystemExit(f"{label} download failed: {e}")
+            time.sleep(30)
+
+
+def retrying_download_file(file_id, out_path, label, attempts=3):
+    url = f"https://drive.google.com/uc?id={file_id}"
+    for attempt in range(attempts):
+        try:
+            download_with_timeout(
+                lambda: gdown.download(url=url, output=str(out_path), quiet=False),
+                timeout_sec=600,
+                label=label,
+            )
+            if Path(out_path).exists():
+                return
+            raise RuntimeError("file not found after download")
+        except Exception as e:
+            print(f"[{label}] attempt {attempt + 1} failed: {e}")
+            if attempt == attempts - 1:
+                raise SystemExit(f"{label} download failed: {e}")
+            time.sleep(30)
+
+
+def probe_duration(path) -> float:
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ])
+    return float(out.strip())
+
+
+def has_audio_stream(path) -> bool:
+    """True if the file has at least one audio stream."""
+    try:
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+        ])
+        return bool(out.strip())
+    except Exception as e:
+        print(f"[WARN] audio-stream probe failed for {path}: {e} -- assuming no audio")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Disk check
+# ---------------------------------------------------------------------------
+stat = os.statvfs(str(TMP))
+free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
+print(f"[DISK] Free space: {free_gb:.1f} GB")
+if free_gb < 4.0:
+    raise SystemExit(f"[DISK] Not enough free space ({free_gb:.1f} GB).")
+
+# ---------------------------------------------------------------------------
+# Download everything -- images folder, songs folder, sub overlay clip
+# ---------------------------------------------------------------------------
+print("Downloading media...")
+retrying_download_folder(IMAGES_FOLDER, TMP / "images", "media")
+print("Downloading songs...")
+retrying_download_folder(SONGS_FOLDER, TMP / "songs", "songs")
+
+sub_path = None
+sub_has_audio = False
+if SUB_FILE_ID:
+    sub_path = TMP / "subscribe_overlay.mp4"
+    print("Downloading subscribe overlay clip...")
+    retrying_download_file(SUB_FILE_ID, sub_path, "subscribe overlay")
+    log_manifest(sub_path.name, "subscribe_overlay", SUB_FILE_ID,
+                 "confirm you have rights to use/host this asset")
+    sub_has_audio = has_audio_stream(sub_path)
+    print(f"[SUB] audio track detected: {sub_has_audio}")
+
+# ---------------------------------------------------------------------------
+# Pick source media -- explicit name if set above (or via TARGET_MEDIA_NAME
+# env var from a CI matrix job), otherwise auto-pick so this runs fully
+# unattended, no prompts, no inputs.
+# ---------------------------------------------------------------------------
+all_candidates = [
+    p for p in (TMP / "images").rglob("*")
+    if p.is_file() and p.suffix.lower() in (IMAGE_EXT + VIDEO_EXT)
+]
+if not all_candidates:
+    raise SystemExit("No usable images/videos found in the images folder.")
+
+if TARGET_MEDIA_NAME:
+    matches = [p for p in all_candidates if p.name == TARGET_MEDIA_NAME]
+    if not matches:
+        raise SystemExit(f"Target media {TARGET_MEDIA_NAME} not found.")
+    media_path = matches[0]
+    pick_note = "explicitly requested"
+else:
+    media_path = random.choice(all_candidates)
+    pick_note = "auto-picked"
+print(f"[MEDIA] Using {media_path.name} ({pick_note})")
+
+log_manifest(media_path.name, "background_media", IMAGES_FOLDER,
+             f"{pick_note}; confirm original license/rights for this asset before publishing")
+
+is_video = media_path.suffix.lower() in VIDEO_EXT
+is_image = media_path.suffix.lower() in IMAGE_EXT
+
+songs = list((TMP / "songs").glob("*.mp3"))
+if not songs:
+    raise SystemExit("No songs found.")
+random.shuffle(songs)
+for s in songs:
+    log_manifest(s.name, "music", SONGS_FOLDER,
+                 "confirm license (e.g. Pixabay page URL) and record it here manually")
+
+print("Song order:")
+for i, s in enumerate(songs):
+    print(f"  {i + 1}. {s.name}")
+
+concat_path = TMP / f"concat_{media_path.stem}.txt"
+estimated_song_len = 200
+repeats = max(1, (DURATION // (len(songs) * estimated_song_len)) + 2)
+with open(concat_path, "w") as f:
+    for _ in range(repeats):
+        batch = songs[:]
+        random.shuffle(batch)
+        for s in batch:
+            f.write(f"file '{s}'\n")
+
+# ---------------------------------------------------------------------------
+# Bitrate math -- hit TARGET_SIZE_GB for this DURATION, hard-capped at
+# MAX_SIZE_BYTES (1.9GB) by the size watcher, floor-checked at 1.0GB.
+# preset=slow buys meaningfully better quality per bit than medium.
+# ---------------------------------------------------------------------------
+target_bits = TARGET_SIZE_BYTES * 8
+target_total_kbps = target_bits / 1000 / DURATION
+video_bitrate_k = max(800, int(target_total_kbps - AUDIO_BITRATE_K))
+print(f"[BITRATE] video={video_bitrate_k}k audio={AUDIO_BITRATE_K}k")
+
+# ---------------------------------------------------------------------------
+# Subscribe overlay schedule -- randomized 3-7 min gaps, fixed position
+# ---------------------------------------------------------------------------
+sub_schedule = []
+if sub_path:
+    sub_clip_duration = probe_duration(sub_path)
+    show_len = min(sub_clip_duration, SUB_MAX_SHOW_SECONDS) if SUB_MAX_SHOW_SECONDS else sub_clip_duration
+    t = random.uniform(10, 45)
+    while t + show_len < DURATION - 5:
+        sub_schedule.append((t, t + show_len))
+        t += show_len + random.uniform(SUB_GAP_MIN_SEC, SUB_GAP_MAX_SEC)
+    print(f"[SUB] {len(sub_schedule)} showings scheduled, each ~{show_len:.1f}s, "
+          f"gaps {SUB_GAP_MIN_SEC//60}-{SUB_GAP_MAX_SEC//60} min")
+
+# ---------------------------------------------------------------------------
+# Output naming
+# ---------------------------------------------------------------------------
+label = CHANNEL_TAG or "render"
+ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+output_path = TMP / f"{label}_{media_path.stem}_{ts}.mp4"
+thumb_path = TMP / f"{label}_{media_path.stem}_{ts}_thumb.jpg"
+
+print(f"\n>>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
+print(f">>> DURATION : {DURATION}s ({DURATION // 60}m {DURATION % 60}s) @ {FPS}fps")
+print(f">>> ZOOM     : {ZOOM_MIN}-{ZOOM_MAX}, {ZOOM_PERIOD_SECONDS/2:.0f}s in / {ZOOM_PERIOD_SECONDS/2:.0f}s out "
+      f"(picked from {ZOOM_PERIOD_OPTIONS}), looping\n")
+
+# ---------------------------------------------------------------------------
+# Filter graph
+# ---------------------------------------------------------------------------
+if is_image:
+    bg_input_args = ["-loop", "1", "-i", str(media_path)]
+    zoom_frames = DURATION * FPS
+    period_frames = ZOOM_PERIOD_SECONDS * FPS
+    amp = (ZOOM_MAX - ZOOM_MIN) / 2
+    mid = ZOOM_MIN + amp
+    zoom_expr = f"{mid}+{amp}*sin(2*PI*on/{period_frames})"
+    # Headroom of 2560x1440 (not a full 4K upscale) is plenty for a 15% zoom
+    # and is far cheaper to process per-frame over a multi-hour render.
+    bg_filter = (
+        f"[0:v]scale=2560:1440:force_original_aspect_ratio=increase,"
+        f"crop=2560:1440,"
+        f"zoompan=z='{zoom_expr}':"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"d={zoom_frames}:s=1920x1080:fps={FPS},"
+        f"format=yuv420p[bg]"
+    )
+else:
+    bg_input_args = ["-an", "-stream_loop", "-1", "-i", str(media_path)]
+    bg_filter = (
+        f"[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+        f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p[bg]"
+    )
+
+filter_parts = [bg_filter]
+video_label = "[bg]"
+next_input_index = 1
+
+logo_input_args = []
+if LOGO_PATH and Path(LOGO_PATH).exists():
+    logo_idx = next_input_index
+    logo_input_args = ["-i", LOGO_PATH]
+    filter_parts.append(f"[{logo_idx}:v]scale=140:-1,format=rgba[logo]")
+    filter_parts.append(f"{video_label}[logo]overlay=x=30:y=30:format=auto[bglogo]")
+    video_label = "[bglogo]"
+    next_input_index += 1
+
+sub_idx = None
+sub_input_args = []
+enable_expr = None
+if sub_path and sub_schedule:
+    sub_idx = next_input_index
+    # Keep audio on this input only if the source clip actually has a
+    # track -- otherwise "-an" as before so ffmpeg doesn't choke on a
+    # missing stream.
+    sub_input_args = (["-stream_loop", "-1", "-i", str(sub_path)] if sub_has_audio
+                       else ["-an", "-stream_loop", "-1", "-i", str(sub_path)])
+    enable_expr = "+".join(f"between(t\\,{a:.2f}\\,{b:.2f})" for a, b in sub_schedule)
+    filter_parts.append(
+        f"[{sub_idx}:v]chromakey={SUB_CHROMA_COLOR}:{SUB_CHROMA_SIMILARITY}:{SUB_CHROMA_BLEND},"
+        f"despill=type=green:mix={SUB_DESPILL_MIX}:expand={SUB_DESPILL_EXPAND},"
+        f"scale={SUB_SCALE_WIDTH}:-1[subkeyed]"
+    )
+    filter_parts.append(
+        f"{video_label}[subkeyed]overlay=x=main_w-overlay_w-30:y=main_h-overlay_h-30:"
+        f"enable='{enable_expr}':format=auto[bgsub]"
+    )
+    video_label = "[bgsub]"
+    next_input_index += 1
+
+disclosure_text = "AI-generated content"
+filter_parts.append(
+    f"{video_label}drawtext=text='{disclosure_text}':fontcolor=white@0.75:fontsize=22:"
+    f"box=1:boxcolor=black@0.35:boxborderw=8:x=24:y=h-th-24[outv]"
+)
+
+filter_complex = ";".join(filter_parts)
+audio_input_index = next_input_index
+
+# Audio: music track is always the base. If the sub clip has its own audio,
+# duck it to SUB_AUDIO_VOLUME and only let it through during the exact
+# seconds the popup is on screen, then mix it under the music.
+if sub_has_audio and sub_idx is not None and enable_expr:
+    filter_complex += (
+        f";[{sub_idx}:a]volume={SUB_AUDIO_VOLUME}:enable='{enable_expr}'[subaud]"
+        f";[{audio_input_index}:a][subaud]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+    )
+    audio_map = ["-map", "[aout]"]
+else:
+    audio_map = ["-map", f"{audio_input_index}:a"]
+
+cmd = [
+    "ffmpeg", "-y",
+    *bg_input_args,
+    *logo_input_args,
+    *sub_input_args,
+    "-f", "concat", "-safe", "0", "-i", str(concat_path),
+    "-t", str(DURATION),
+    "-filter_complex", filter_complex,
+    "-map", "[outv]",
+    *audio_map,
+    "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-pix_fmt", "yuv420p",
+    "-b:v", f"{video_bitrate_k}k",
+    "-maxrate", f"{int(video_bitrate_k * 1.15)}k",
+    "-bufsize", f"{int(video_bitrate_k * 2)}k",
+    "-r", str(FPS), "-g", str(FPS * 2),
+    "-c:a", "aac", "-b:a", f"{AUDIO_BITRATE_K}k", "-ar", "48000",
+    "-movflags", "+faststart",
+    str(output_path),
+]
+
+print("\nRunning FFmpeg...")
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+stopped_by_watcher = False
+
+
+def size_watcher():
+    global stopped_by_watcher
+    while proc.poll() is None:
+        time.sleep(15)
+        if output_path.exists():
+            size = output_path.stat().st_size
+            print(f"[SIZE] {size / (1024 * 1024):.1f} MB", flush=True)
+            if size >= MAX_SIZE_BYTES:
+                print("[SIZE] Cap reached (1.9GB) -- stopping.", flush=True)
+                stopped_by_watcher = True
+                proc.terminate()
+                break
+
+
+watcher = threading.Thread(target=size_watcher, daemon=True)
+watcher.start()
+
+for line in proc.stdout:
+    print(line, end="", flush=True)
+
+proc.wait()
+watcher.join()
+
+if not stopped_by_watcher and proc.returncode != 0:
+    raise SystemExit(f"FFmpeg failed: {proc.returncode}")
+
+if not output_path.exists() or output_path.stat().st_size == 0:
+    raise SystemExit("No output produced.")
+
+final_size_mb = output_path.stat().st_size / (1024 * 1024)
+final_size_bytes = output_path.stat().st_size
+print(f"\nDONE -- {output_path}")
+print(f"Size   : {final_size_mb:.1f} MB")
+if final_size_bytes < MIN_SIZE_BYTES:
+    print(f"[WARN] Output is under the 1.0GB floor -- consider raising TARGET_SIZE_GB or DURATION_MIN_SEC.")
+
+# ---------------------------------------------------------------------------
+# Thumbnail -- pull a frame from partway through for the release
+# ---------------------------------------------------------------------------
+try:
+    actual_duration = probe_duration(output_path)
+    grab_at = max(5, min(actual_duration * 0.15, actual_duration - 5))
+    subprocess.run([
+        "ffmpeg", "-y", "-ss", str(grab_at), "-i", str(output_path),
+        "-frames:v", "1", "-q:v", "2", str(thumb_path),
+    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print(f"Thumbnail: {thumb_path}")
+except Exception as e:
+    print(f"[WARN] thumbnail generation failed: {e}")
+    thumb_path = None
+
+print(f"Manifest updated at: {MANIFEST_PATH.resolve()}")
+print("\nReminder before publishing:")
+print(" 1. In YouTube Studio upload flow, toggle 'Altered or synthetic content' if applicable.")
+print(" 2. Write a real, specific title/description/thumbnail for this upload -- no template text.")
+print(" 3. Double check every song/image/overlay row in asset_manifest.csv has a real license source noted.")
+
+github_output = os.environ.get("GITHUB_OUTPUT")
+if github_output:
+    with open(github_output, "a") as f:
+        f.write(f"output_path={output_path}\n")
+        f.write(f"thumb_path={thumb_path if thumb_path else ''}\n")
+        f.write(f"media_name={media_path.name}\n")
+        f.write(f"duration_seconds={DURATION}\n")
+        f.write(f"final_size_mb={final_size_mb:.1f}\n")
