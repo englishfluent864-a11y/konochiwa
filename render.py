@@ -12,14 +12,19 @@ same random file. Manual single runs (no env var set) keep the original
 auto-pick behavior.
 
 Pipeline:
-  - Background image with a continuous oscillating zoom: 7s zoom-in,
-    7s zoom-out, forever.
+  - Background image with a continuous oscillating zoom: same 1.0-1.15
+    zoom range as always, but the cycle length (how long one in+out
+    breath takes) is picked randomly per render from ZOOM_PERIOD_OPTIONS,
+    so consecutive uploads don't all pulse at the same identical pace.
   - Fixed-position brand logo overlay (optional).
   - Visible "AI-generated content" disclosure label (bottom-left).
     Pair with YouTube Studio's "Altered or synthetic content" toggle at
     upload time -- that's the metadata half, this script can't set it.
-  - Green-screen "Subscribe" clip, chroma-keyed, fixed bottom-right,
-    appearing on randomized 3-7 minute gaps.
+  - Green-screen "Subscribe" clip, chroma-keyed (+despill for a clean
+    edge), fixed bottom-right, appearing on randomized 3-7 minute gaps.
+    If the clip itself has an audio track, it's mixed in at 5% volume,
+    only during the seconds it's actually shown on screen, ducked under
+    the music. If it has no audio track, it stays silent as before.
   - Thumbnail frame pulled from the finished render for the release.
   - asset_manifest.csv logs every asset used per render -- confirm/own
     the rights to everything pointed at here; the manifest is a paper
@@ -56,7 +61,12 @@ DURATION_MAX_SEC = 9000      # 2.5 hours -- leaves real margin under GitHub's 6h
 FPS = 24
 ZOOM_MIN = 1.0
 ZOOM_MAX = 1.15
-ZOOM_PERIOD_SECONDS = 14.0  # 7s in / 7s out, forever
+# Cycle length is randomized per render (not fixed) so the "breathing" pace
+# varies between uploads instead of feeling identical every time. Same
+# zoom range/style every render -- only the speed of one in+out cycle
+# changes. Add/remove values here to widen or narrow the variety.
+ZOOM_PERIOD_OPTIONS = [8.0, 10.0, 12.0, 15.0, 18.0, 20.0]
+ZOOM_PERIOD_SECONDS = random.choice(ZOOM_PERIOD_OPTIONS)
 
 AUDIO_BITRATE_K = 192
 TARGET_SIZE_GB = 1.5        # aim point
@@ -67,9 +77,18 @@ SUB_GAP_MIN_SEC = 180       # 3 min
 SUB_GAP_MAX_SEC = 420       # 7 min
 SUB_MAX_SHOW_SECONDS = 6.0
 SUB_CHROMA_COLOR = "0x00FF00"
-SUB_CHROMA_SIMILARITY = "0.18"
-SUB_CHROMA_BLEND = "0.06"
+# Tightened for a cleaner key on a flat, saturated green background.
+SUB_CHROMA_SIMILARITY = "0.14"
+SUB_CHROMA_BLEND = "0.10"
 SUB_SCALE_WIDTH = "340"
+# Despill strength -- pulls residual green fringe off the edges/highlights
+# left behind after chromakey without eating into the subject itself.
+SUB_DESPILL_MIX = "0.4"
+SUB_DESPILL_EXPAND = "0.1"
+# Clip audio (only used if the source clip actually has an audio track --
+# detected automatically below). Kept quiet and ducked under the music,
+# and only heard during the seconds the popup is actually on screen.
+SUB_AUDIO_VOLUME = 0.05
 
 MANIFEST_PATH = Path("asset_manifest.csv")
 TMP = Path("/tmp/render")
@@ -166,6 +185,19 @@ def probe_duration(path) -> float:
     return float(out.strip())
 
 
+def has_audio_stream(path) -> bool:
+    """True if the file has at least one audio stream."""
+    try:
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+        ])
+        return bool(out.strip())
+    except Exception as e:
+        print(f"[WARN] audio-stream probe failed for {path}: {e} -- assuming no audio")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Disk check
 # ---------------------------------------------------------------------------
@@ -184,12 +216,15 @@ print("Downloading songs...")
 retrying_download_folder(SONGS_FOLDER, TMP / "songs", "songs")
 
 sub_path = None
+sub_has_audio = False
 if SUB_FILE_ID:
     sub_path = TMP / "subscribe_overlay.mp4"
     print("Downloading subscribe overlay clip...")
     retrying_download_file(SUB_FILE_ID, sub_path, "subscribe overlay")
     log_manifest(sub_path.name, "subscribe_overlay", SUB_FILE_ID,
                  "confirm you have rights to use/host this asset")
+    sub_has_audio = has_audio_stream(sub_path)
+    print(f"[SUB] audio track detected: {sub_has_audio}")
 
 # ---------------------------------------------------------------------------
 # Pick source media -- explicit name if set above (or via TARGET_MEDIA_NAME
@@ -276,7 +311,8 @@ thumb_path = TMP / f"{label}_{media_path.stem}_{ts}_thumb.jpg"
 
 print(f"\n>>> MEDIA    : {media_path.name} ({'video' if is_video else 'image'})")
 print(f">>> DURATION : {DURATION}s ({DURATION // 60}m {DURATION % 60}s) @ {FPS}fps")
-print(f">>> ZOOM     : {ZOOM_MIN}-{ZOOM_MAX}, {ZOOM_PERIOD_SECONDS/2:.0f}s in / {ZOOM_PERIOD_SECONDS/2:.0f}s out, looping\n")
+print(f">>> ZOOM     : {ZOOM_MIN}-{ZOOM_MAX}, {ZOOM_PERIOD_SECONDS/2:.0f}s in / {ZOOM_PERIOD_SECONDS/2:.0f}s out "
+      f"(picked from {ZOOM_PERIOD_OPTIONS}), looping\n")
 
 # ---------------------------------------------------------------------------
 # Filter graph
@@ -318,13 +354,20 @@ if LOGO_PATH and Path(LOGO_PATH).exists():
     video_label = "[bglogo]"
     next_input_index += 1
 
+sub_idx = None
 sub_input_args = []
+enable_expr = None
 if sub_path and sub_schedule:
     sub_idx = next_input_index
-    sub_input_args = ["-an", "-stream_loop", "-1", "-i", str(sub_path)]
+    # Keep audio on this input only if the source clip actually has a
+    # track -- otherwise "-an" as before so ffmpeg doesn't choke on a
+    # missing stream.
+    sub_input_args = (["-stream_loop", "-1", "-i", str(sub_path)] if sub_has_audio
+                       else ["-an", "-stream_loop", "-1", "-i", str(sub_path)])
     enable_expr = "+".join(f"between(t\\,{a:.2f}\\,{b:.2f})" for a, b in sub_schedule)
     filter_parts.append(
         f"[{sub_idx}:v]chromakey={SUB_CHROMA_COLOR}:{SUB_CHROMA_SIMILARITY}:{SUB_CHROMA_BLEND},"
+        f"despill=type=green:mix={SUB_DESPILL_MIX}:expand={SUB_DESPILL_EXPAND},"
         f"scale={SUB_SCALE_WIDTH}:-1[subkeyed]"
     )
     filter_parts.append(
@@ -343,6 +386,18 @@ filter_parts.append(
 filter_complex = ";".join(filter_parts)
 audio_input_index = next_input_index
 
+# Audio: music track is always the base. If the sub clip has its own audio,
+# duck it to SUB_AUDIO_VOLUME and only let it through during the exact
+# seconds the popup is on screen, then mix it under the music.
+if sub_has_audio and sub_idx is not None and enable_expr:
+    filter_complex += (
+        f";[{sub_idx}:a]volume={SUB_AUDIO_VOLUME}:enable='{enable_expr}'[subaud]"
+        f";[{audio_input_index}:a][subaud]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+    )
+    audio_map = ["-map", "[aout]"]
+else:
+    audio_map = ["-map", f"{audio_input_index}:a"]
+
 cmd = [
     "ffmpeg", "-y",
     *bg_input_args,
@@ -352,7 +407,7 @@ cmd = [
     "-t", str(DURATION),
     "-filter_complex", filter_complex,
     "-map", "[outv]",
-    "-map", f"{audio_input_index}:a",
+    *audio_map,
     "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-pix_fmt", "yuv420p",
     "-b:v", f"{video_bitrate_k}k",
     "-maxrate", f"{int(video_bitrate_k * 1.15)}k",
